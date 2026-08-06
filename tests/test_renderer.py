@@ -1,0 +1,153 @@
+"""フレーム変換処理に関するテスト."""
+
+from __future__ import annotations
+
+import re
+
+import numpy as np
+import pytest
+
+from fraterm import config, renderer
+from fraterm.errors import PlaybackError
+
+# 24bitカラー指定を取り出す正規表現
+FOREGROUND_PATTERN = re.compile(r"38;2;(\d+);(\d+);(\d+)")
+
+
+def makeFrame(width: int, height: int, value: int = 0) -> np.ndarray:
+  """単色のBGRフレームを作る."""
+  return np.full((height, width, 3), value, dtype=np.uint8)
+
+
+def test_computeSizeKeepsAspectRatio():
+  """文字セルの縦横比を考慮して行数が決まることを確認する."""
+  columns, rows = renderer.computeSize(1920, 1080, 100, 40)
+  assert columns == 100
+  assert rows == round(100 * (1080 / 1920) / config.CELL_ASPECT_RATIO)
+
+
+def test_computeSizeFitsInTerminalHeight():
+  """縦に収まらない場合は行数を基準に列数が計算されることを確認する."""
+  terminalHeight = 10
+  columns, rows = renderer.computeSize(1920, 1080, 200, terminalHeight)
+  assert rows == terminalHeight - config.STATUS_ROW_COUNT
+  assert columns <= 200
+
+
+def test_computeSizeRespectsMaxWidth():
+  """--width 指定が上限として働くことを確認する."""
+  columns, _ = renderer.computeSize(1920, 1080, 200, 60, maxWidth=40)
+  assert columns == 40
+
+
+def test_computeSizeRejectsEmptyFrame():
+  """フレームサイズが不正な場合にエラーになることを確認する."""
+  with pytest.raises(PlaybackError):
+    renderer.computeSize(0, 0, 80, 24)
+
+
+def test_pixelHeightForModes():
+  """ハーフブロックのモードでは縦方向に2倍の画素を使うことを確認する."""
+  assert renderer.pixelHeightFor(10, config.MODE_ASCII) == 10
+  assert renderer.pixelHeightFor(10, config.MODE_COLOR) == 20
+  assert renderer.pixelHeightFor(10, config.MODE_MONO) == 20
+
+
+def test_renderAsciiHasRequestedShape():
+  """ASCII描画が指定した行数・列数になることを確認する."""
+  output = renderer.renderAscii(makeFrame(64, 48, 128), 20, 8)
+  lines = output.split("\n")
+  assert len(lines) == 8
+  assert all(len(line) == 20 for line in lines)
+
+
+def test_renderAsciiMapsBrightnessToCharset():
+  """暗い画素と明るい画素が文字セットの両端へ対応することを確認する."""
+  charset = " .:-=+*#%@"
+
+  darkOutput = renderer.renderAscii(makeFrame(16, 16, 0), 8, 4, charset)
+  assert set(darkOutput.replace("\n", "")) == {charset[0]}
+
+  brightOutput = renderer.renderAscii(makeFrame(16, 16, 255), 8, 4, charset)
+  assert set(brightOutput.replace("\n", "")) == {charset[-1]}
+
+
+def test_renderAsciiWithSingleCharacterCharset():
+  """1文字だけの文字セットでも例外にならないことを確認する."""
+  output = renderer.renderAscii(makeFrame(16, 16, 128), 4, 2, "#")
+  assert output.split("\n") == ["####", "####"]
+
+
+def test_renderAsciiBrightnessRaisesValues():
+  """明るさ補正が出力を明るい側の文字へ寄せることを確認する."""
+  charset = " .:-=+*#%@"
+  baseOutput = renderer.renderAscii(makeFrame(16, 16, 100), 4, 2, charset)
+  brightOutput = renderer.renderAscii(
+    makeFrame(16, 16, 100), 4, 2, charset, brightness=0.5
+  )
+  assert charset.index(brightOutput[0]) > charset.index(baseOutput[0])
+
+
+def test_renderHalfBlockUsesBlockCharacters():
+  """カラー描画がハーフブロック文字とANSIコードを含むことを確認する."""
+  frame = makeFrame(32, 32, 200)
+  output = renderer.renderHalfBlock(frame, 10, 4)
+  lines = output.split("\n")
+
+  assert len(lines) == 4
+  assert all(line.count(renderer.UPPER_HALF_BLOCK) == 10 for line in lines)
+  assert all(line.startswith(renderer.ESC) for line in lines)
+  assert all(line.endswith(renderer.RESET) for line in lines)
+
+
+def test_renderHalfBlockOmitsRepeatedColorCodes():
+  """同じ色が続く場合にANSIコードが省略されることを確認する."""
+  output = renderer.renderHalfBlock(makeFrame(32, 32, 128), 20, 2)
+  # 単色フレームなら，色指定は行の先頭のみで済む
+  assert output.split("\n")[0].count("38;2;") == 1
+
+
+def test_renderMonoProducesGrayColors():
+  """monoモードの出力が白黒（RGBが同じ値）になることを確認する."""
+  frame = np.zeros((16, 16, 3), dtype=np.uint8)
+  frame[:, :, 0] = 200  # 青成分のみを強くする
+  output = renderer.renderHalfBlock(frame, 8, 2, grayscale=True)
+
+  matches = FOREGROUND_PATTERN.findall(output)
+  assert matches
+  assert all(red == green == blue for red, green, blue in matches)
+
+
+def test_renderFrameDispatchesByMode():
+  """モードごとに適切な描画関数が呼ばれることを確認する."""
+  frame = makeFrame(32, 32, 180)
+
+  asciiOutput = renderer.renderFrame(frame, config.MODE_ASCII, 8, 2)
+  assert renderer.ESC not in asciiOutput
+
+  colorOutput = renderer.renderFrame(frame, config.MODE_COLOR, 8, 2)
+  assert renderer.UPPER_HALF_BLOCK in colorOutput
+
+
+def test_renderFrameRejectsUnknownMode():
+  """未知のモードを指定した場合にエラーになることを確認する."""
+  with pytest.raises(PlaybackError):
+    renderer.renderFrame(makeFrame(8, 8), "hologram", 4, 2)
+
+
+def test_renderAcceptsGrayscaleFrame():
+  """グレースケール画像でも描画できることを確認する."""
+  grayFrame = np.full((16, 16), 120, dtype=np.uint8)
+  assert renderer.renderAscii(grayFrame, 4, 2)
+  assert renderer.renderHalfBlock(grayFrame, 4, 2)
+
+
+def test_supportsTrueColorDetectsColorterm(monkeypatch):
+  """COLORTERM から24bitカラー対応を判定できることを確認する."""
+  monkeypatch.setenv("COLORTERM", "truecolor")
+  assert renderer.supportsTrueColor() is True
+
+  monkeypatch.setenv("COLORTERM", "")
+  monkeypatch.setenv("TERM", "xterm")
+  monkeypatch.setenv("TERM_PROGRAM", "")
+  assert renderer.supportsTrueColor() is False
