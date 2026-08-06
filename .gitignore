@@ -18,3 +18,10 @@ htmlcov/
 .vscode/
 .idea/
 .DS_Store
+
+# AI
+AGENT.md
+CLAUDE.md
+.cursorrules
+.cline.json
+*.ai.md
