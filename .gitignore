@@ -25,3 +25,22 @@ CLAUDE.md
 .cursorrules
 .cline.json
 *.ai.md
+
+# 秘匿情報・環境変数
+.env
+.env.*
+*.pem
+secrets/
+
+# OSファイル
+Thumbs.db
+Desktop.ini
+
+# Pythonその他
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.so
+*.pyd
+.ipynb_checkpoints/
