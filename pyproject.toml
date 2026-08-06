@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fraterm"
+version = "0.1.0"
+description = "動画をターミナル上でASCII・ANSIカラーとして再生するCLIツール"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "HR0101" }]
+keywords = ["ascii", "ansi", "terminal", "video", "player", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Video :: Display",
+]
+dependencies = ["opencv-python>=4.8", "numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+fraterm = "fraterm.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/HR0101/FraTerm"
+
+[tool.setuptools]
+packages = ["fraterm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
