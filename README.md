@@ -152,6 +152,16 @@ python -m pip install -e ".[dev]"
 python -m pytest
 ```
 
+インストール時にCコンパイラを利用できる場合は，カラー・モノクロ描画の
+ANSI文字列生成をC拡張で高速化します．ビルドできない環境では，同じ出力の
+Python実装へ自動的にフォールバックします．状態確認と，リポジトリのルートで
+実行する開発用ベンチマークは次のとおりです．
+
+```bash
+python -c "from fraterm import renderer; print(renderer.HAS_NATIVE_RENDERER)"
+python -m benchmarks.benchmark_renderer
+```
+
 | ファイル | 役割 |
 |---|---|
 | `fraterm/cli.py` | コマンドライン引数の解析 |
