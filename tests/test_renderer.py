@@ -107,6 +107,59 @@ def test_renderHalfBlockOmitsRepeatedColorCodes():
   assert output.split("\n")[0].count("38;2;") == 1
 
 
+def test_renderHalfBlockFallbackMatchesSelectedRenderer(monkeypatch):
+  """Pythonフォールバックが選択中の描画実装と同じ結果を返すことを確認する."""
+  frame = np.arange(12 * 16 * 3, dtype=np.uint8).reshape(12, 16, 3)
+  expected = renderer.renderHalfBlock(
+    frame, 7, 3, brightness=0.2, contrast=1.4
+  )
+
+  monkeypatch.setattr(renderer, "_native", None)
+  assert renderer.renderHalfBlock(
+    frame, 7, 3, brightness=0.2, contrast=1.4
+  ) == expected
+
+
+@pytest.mark.skipif(
+  renderer._native is None, reason="任意のC拡張がビルドされていません"
+)
+@pytest.mark.parametrize("grayscale", [False, True])
+def test_nativeRendererMatchesPythonFallback(grayscale):
+  """C拡張とPython実装のANSI出力がバイト単位で一致することを確認する."""
+  frame = np.arange(18 * 20 * 3, dtype=np.uint8).reshape(18, 20, 3)
+  colorFrame = frame
+  if grayscale:
+    import cv2
+
+    grayFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    colorFrame = cv2.cvtColor(grayFrame, cv2.COLOR_GRAY2BGR)
+
+  assert renderer._native.renderHalfBlock(colorFrame) == (
+    renderer._renderHalfBlockPython(colorFrame)
+  )
+
+
+@pytest.mark.skipif(
+  renderer._native is None, reason="任意のC拡張がビルドされていません"
+)
+def test_nativeRendererAcceptsNonContiguousFrame():
+  """C拡張が負のstrideを持つ画像も正しく読み取ることを確認する."""
+  frame = np.arange(12 * 10 * 3, dtype=np.uint8).reshape(12, 10, 3)
+  reversedFrame = frame[:, ::-1, :]
+  assert renderer._native.renderHalfBlock(reversedFrame) == (
+    renderer._renderHalfBlockPython(reversedFrame)
+  )
+
+
+@pytest.mark.skipif(
+  renderer._native is None, reason="任意のC拡張がビルドされていません"
+)
+def test_nativeRendererRejectsInvalidFrameShape():
+  """C拡張が不正な配列を安全に拒否することを確認する."""
+  with pytest.raises(ValueError):
+    renderer._native.renderHalfBlock(np.zeros((4, 4), dtype=np.uint8))
+
+
 def test_renderMonoProducesGrayColors():
   """monoモードの出力が白黒（RGBが同じ値）になることを確認する."""
   frame = np.zeros((16, 16, 3), dtype=np.uint8)

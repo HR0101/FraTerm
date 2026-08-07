@@ -10,6 +10,11 @@ import numpy as np
 from . import config
 from .errors import PlaybackError
 
+try:
+  from . import _native
+except ImportError:  # Cコンパイラがない環境ではPython実装へ戻す
+  _native = None
+
 ESC = "\x1b"
 RESET = f"{ESC}[0m"
 
@@ -21,6 +26,9 @@ MAX_PIXEL_VALUE = 255
 
 # True Color対応と判断するCOLORTERMの値
 TRUE_COLOR_HINTS = ("truecolor", "24bit")
+
+# インストール時にC拡張をビルドできたかを診断やベンチマークで確認できるようにする
+HAS_NATIVE_RENDERER = _native is not None
 
 
 def supportsTrueColor() -> bool:
@@ -140,6 +148,16 @@ def renderHalfBlock(
     smallFrame = cv2.cvtColor(grayFrame, cv2.COLOR_GRAY2BGR)
 
   smallFrame = _adjust(smallFrame, brightness, contrast)
+
+  if _native is not None:
+    return _native.renderHalfBlock(smallFrame)
+
+  return _renderHalfBlockPython(smallFrame)
+
+
+def _renderHalfBlockPython(smallFrame: np.ndarray) -> str:
+  """C拡張を利用できない環境向けにANSI文字列をPythonで組み立てる."""
+  rows = smallFrame.shape[0] // 2
 
   # OpenCVはBGR順のため，RGB順へ並べ替える
   rgbFrame = smallFrame[:, :, ::-1]
