@@ -45,6 +45,13 @@ GRAYSCALE_TOLERANCE = 12
 # True Color対応と判断するCOLORTERMの値
 TRUE_COLOR_HINTS = ("truecolor", "24bit")
 
+# レターボックス検出の設定．黒い映像そのものを誤って切らないよう，
+# 画面端の大部分が暗い行だけを対象にし，中央の映像領域も確認する．
+LETTERBOX_BLACK_LEVEL = 24
+LETTERBOX_DARK_PERCENTILE = 50
+LETTERBOX_MIN_FRACTION = 0.02
+LETTERBOX_MIN_CONTENT_FRACTION = 0.4
+
 # インストール時にC拡張をビルドできたかを診断やベンチマークで確認できるようにする
 HAS_NATIVE_RENDERER = _native is not None
 
@@ -62,6 +69,51 @@ def supportsTrueColor() -> bool:
   # iTerm2 や Apple Terminal など，COLORTERM を設定しない環境向けの判定
   termProgram = os.environ.get("TERM_PROGRAM", "").lower()
   return termProgram in {"iterm.app", "wezterm", "vscode", "ghostty", "hyper"}
+
+
+def detectLetterbox(frame: np.ndarray) -> tuple[int, int]:
+  """上下の黒帯を検出し，映像領域の上下端（下端は排他的）を返す.
+
+  全体が暗い映像や短い暗転を黒帯と誤認しないよう，黒い行の連続長と
+  残った中央領域の明るさを同時に確認する．検出できない場合は全領域を返す.
+  """
+  if frame.ndim not in (2, 3) or frame.shape[0] < 8 or frame.shape[1] < 8:
+    return 0, frame.shape[0]
+
+  frameHeight = frame.shape[0]
+  if frame.ndim == 3:
+    grayFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+  else:
+    grayFrame = frame
+
+  # 行の境界を正確に保つため，検出は縮小せず元の横幅で行う．
+  # この処理は動画ごとに最初の1フレームだけなので，表示中の負荷は増えない．
+  graySample = grayFrame
+  sampleHeight = frameHeight
+
+  # 字幕など少数の明るい画素が黒帯にあっても検出できるよう，行の中央値を見る．
+  rowBrightness = np.percentile(graySample, LETTERBOX_DARK_PERCENTILE, axis=1)
+  darkRows = rowBrightness <= LETTERBOX_BLACK_LEVEL
+  minimumRows = max(2, round(sampleHeight * LETTERBOX_MIN_FRACTION))
+
+  top = 0
+  while top < sampleHeight and darkRows[top]:
+    top += 1
+  bottom = sampleHeight
+  while bottom > top and darkRows[bottom - 1]:
+    bottom -= 1
+
+  top = top if top >= minimumRows else 0
+  bottom = bottom if sampleHeight - bottom >= minimumRows else sampleHeight
+  contentHeight = bottom - top
+  if contentHeight < sampleHeight * LETTERBOX_MIN_CONTENT_FRACTION:
+    return 0, frameHeight
+
+  contentSample = graySample[top:bottom]
+  if np.percentile(contentSample, 95) <= LETTERBOX_BLACK_LEVEL + 16:
+    return 0, frameHeight
+
+  return top, bottom
 
 
 def computeSize(

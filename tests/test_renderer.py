@@ -82,6 +82,32 @@ def test_computeSizeRejectsEmptyFrame():
     renderer.computeSize(0, 0, 80, 24)
 
 
+def test_detectLetterboxReturnsActiveImageBounds():
+  """上下の黒帯を除いた映像領域を検出できることを確認する."""
+  frame = np.full((100, 200, 3), 180, dtype=np.uint8)
+  frame[:15] = 0
+  frame[-15:] = 0
+
+  assert renderer.detectLetterbox(frame) == (15, 85)
+
+
+def test_detectLetterboxToleratesSubtitleInBlackBar():
+  """黒帯内の字幕のような明るい画素を許容することを確認する."""
+  frame = np.full((100, 200, 3), 180, dtype=np.uint8)
+  frame[:15] = 0
+  frame[-15:] = 0
+  frame[-8, 20:80] = 255
+
+  assert renderer.detectLetterbox(frame) == (15, 85)
+
+
+def test_detectLetterboxKeepsUniformDarkFrame():
+  """全体が暗い映像を黒帯として切り取らないことを確認する."""
+  frame = np.full((100, 200, 3), 8, dtype=np.uint8)
+
+  assert renderer.detectLetterbox(frame) == (0, 100)
+
+
 def test_pixelHeightForModes():
   """ハーフブロックのモードでは縦方向に2倍の画素を使うことを確認する."""
   assert renderer.pixelHeightFor(10, config.MODE_ASCII) == 10

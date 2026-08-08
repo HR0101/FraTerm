@@ -141,6 +141,7 @@ class Player:
     self._nextFrameIndex = 0
     self._lastRenderedMedia: float | None = None
     self._lastSize: tuple[int, int] | None = None
+    self._letterboxBounds: tuple[int, int] | None = None
     self._audioPlayer: audioModule.AudioPlayer | None = None
     self._previousHandlers: dict = {}
     self._keyReader: KeyReader | None = None
@@ -173,6 +174,7 @@ class Player:
       )
 
     self._capture = capture
+    self._letterboxBounds = None
     self._videoFps = self._readFps(capture, cv2)
     self._duration = self._readDuration(capture, cv2)
     if self._duration <= 0 and self.options.duration:
@@ -628,6 +630,13 @@ class Player:
 
   def _drawFrame(self, frame) -> None:
     """1フレーム分の文字列を組み立てて出力する."""
+    if self._letterboxBounds is None:
+      self._letterboxBounds = renderer.detectLetterbox(frame)
+    top, bottom = self._letterboxBounds
+    if top > 0 or bottom < frame.shape[0]:
+      # 映画由来の黒帯を除いてからサイズ計算し，映像部分を端末いっぱいに表示する
+      frame = frame[top:bottom]
+
     frameHeight, frameWidth = frame.shape[:2]
     terminalWidth, terminalHeight = self._terminalSize()
     columns, rows = renderer.computeSize(
