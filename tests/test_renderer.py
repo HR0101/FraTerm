@@ -171,12 +171,69 @@ def test_renderMonoProducesGrayColors():
   assert all(red == green == blue for red, green, blue in matches)
 
 
+def makeStripedFrame(width: int, height: int) -> np.ndarray:
+  """縦方向にはっきりした境界を持つフレームを作る."""
+  frame = np.zeros((height, width, 3), dtype=np.uint8)
+  frame[:, width // 2 :] = 255
+  return frame
+
+
+def test_renderEdgeHasRequestedShape():
+  """輪郭描画が指定した行数・列数になることを確認する."""
+  output = renderer.renderEdge(makeStripedFrame(96, 96), 24, 8)
+  lines = output.split("\n")
+  assert len(lines) == 8
+  assert all(len(line) == 24 for line in lines)
+
+
+def test_renderEdgeDetectsVerticalBoundary():
+  """縦の境界が縦線の記号で描かれることを確認する."""
+  output = renderer.renderEdge(makeStripedFrame(96, 96), 24, 8)
+  lines = output.split("\n")
+
+  # 境界のある中央付近の列に縦線が現れる
+  middleColumns = [line[11:13] for line in lines]
+  assert any("|" in columns for columns in middleColumns)
+
+
+def test_renderEdgeDetectsHorizontalBoundary():
+  """横の境界が横線の記号で描かれることを確認する."""
+  frame = np.zeros((96, 96, 3), dtype=np.uint8)
+  frame[48:, :] = 255
+  output = renderer.renderEdge(frame, 24, 8)
+  assert "-" in output
+
+
+def test_renderEdgeUsesFillWhereFlat():
+  """平坦な部分は明るさに応じた文字で塗られることを確認する."""
+  output = renderer.renderEdge(makeFrame(64, 64, 0), 16, 4, " .:")
+  assert set(output.replace("\n", "")) == {" "}
+
+
+def test_renderEdgeIsMonochrome():
+  """輪郭モードがANSIカラーを含まないことを確認する."""
+  output = renderer.renderEdge(makeStripedFrame(96, 96), 24, 8)
+  assert renderer.ESC not in output
+
+
+def test_edgeModeUsesItsOwnDefaultCharset():
+  """輪郭モードでは既定の塗り文字が切り替わることを確認する."""
+  assert config.charsetFor(config.MODE_EDGE, None) == config.DEFAULT_EDGE_CHARSET
+  assert config.charsetFor(config.MODE_ASCII, None) == config.DEFAULT_CHARSET
+  # 明示的に指定した場合は，モードによらずその指定を使う
+  assert config.charsetFor(config.MODE_EDGE, "simple") == config.CHARSET_PRESETS["simple"]
+
+
 def test_renderFrameDispatchesByMode():
   """モードごとに適切な描画関数が呼ばれることを確認する."""
   frame = makeFrame(32, 32, 180)
 
   asciiOutput = renderer.renderFrame(frame, config.MODE_ASCII, 8, 2)
   assert renderer.ESC not in asciiOutput
+
+  edgeOutput = renderer.renderFrame(makeStripedFrame(96, 96), config.MODE_EDGE, 24, 8)
+  assert renderer.ESC not in edgeOutput
+  assert any(character in edgeOutput for character in renderer.EDGE_CHARACTERS)
 
   colorOutput = renderer.renderFrame(frame, config.MODE_COLOR, 8, 2)
   assert renderer.UPPER_HALF_BLOCK in colorOutput

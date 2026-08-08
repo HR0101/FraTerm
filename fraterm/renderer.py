@@ -21,6 +21,13 @@ RESET = f"{ESC}[0m"
 # 上半分のみを塗るブロック文字．前景色で上の画素，背景色で下の画素を表現する
 UPPER_HALF_BLOCK = "▀"
 
+# 輪郭の向き（輝度勾配を45度ごとに4分割したもの）に対応する文字
+# 勾配と直交する方向が線の向きになるため，縦の勾配には横線を割り当てる
+EDGE_CHARACTERS = ("|", "/", "-", "\\")
+
+# 勾配の向きを4方向へ量子化する際の1区分の角度
+EDGE_ANGLE_STEP = np.pi / 4.0
+
 # 8bit値の上限
 MAX_PIXEL_VALUE = 255
 
@@ -131,6 +138,74 @@ def renderAscii(
   return "\n".join("".join(row) for row in characters)
 
 
+def renderEdge(
+  frame: np.ndarray,
+  columns: int,
+  rows: int,
+  charset: str = config.DEFAULT_EDGE_CHARSET,
+  brightness: float = config.DEFAULT_BRIGHTNESS,
+  contrast: float = config.DEFAULT_CONTRAST,
+) -> str:
+  """輪郭を検出し，線の向きに応じた記号で描画する（白黒）.
+
+  明るさだけで文字を選ぶ方式と異なり，物の形が線として現れる.
+  """
+  if not charset:
+    charset = config.DEFAULT_EDGE_CHARSET
+
+  grayFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+
+  # 1文字を複数画素で判定するため，文字数より細かい格子へ縮小する
+  sampleFactor = config.EDGE_SAMPLE_FACTOR
+  sampleFrame = _resize(grayFrame, columns * sampleFactor, rows * sampleFactor)
+  sampleFrame = _adjust(sampleFrame, brightness, contrast)
+
+  # 細かなノイズを線として拾わないよう，わずかにぼかす
+  blurredFrame = cv2.GaussianBlur(sampleFrame, (3, 3), 0)
+  gradientX = cv2.Sobel(blurredFrame, cv2.CV_32F, 1, 0, ksize=3)
+  gradientY = cv2.Sobel(blurredFrame, cv2.CV_32F, 0, 1, ksize=3)
+
+  magnitude = cv2.magnitude(gradientX, gradientY)
+  angle = np.arctan2(gradientY, gradientX)
+  # 180度周期のため，4方向へ丸めて剰余を取る
+  directionBins = np.mod(np.rint(angle / EDGE_ANGLE_STEP), len(EDGE_CHARACTERS))
+  directionBins = directionBins.astype(np.int16)
+
+  # 映像の明暗差に合わせ，しきい値をフレームごとに決める
+  threshold = max(
+    config.EDGE_MIN_THRESHOLD,
+    float(np.percentile(magnitude, config.EDGE_PERCENTILE)),
+  )
+  strongMask = magnitude >= threshold
+
+  # 文字セルごとに，どの向きの線が最も多いかを数える
+  binBlocks = directionBins.reshape(rows, sampleFactor, columns, sampleFactor)
+  maskBlocks = strongMask.reshape(rows, sampleFactor, columns, sampleFactor)
+  directionCounts = np.stack(
+    [
+      np.logical_and(maskBlocks, binBlocks == binIndex).sum(axis=(1, 3))
+      for binIndex in range(len(EDGE_CHARACTERS))
+    ],
+    axis=-1,
+  )
+
+  dominantDirection = directionCounts.argmax(axis=-1)
+  dominantCount = directionCounts.max(axis=-1)
+  requiredCount = max(1, int(sampleFactor * sampleFactor * config.EDGE_MIN_RATIO))
+
+  # 線と判定されなかったセルは，明るさに応じた文字で塗る
+  cellLuminance = _adjust(_resize(grayFrame, columns, rows), brightness, contrast)
+  lastIndex = max(1, len(charset) - 1)
+  fillIndices = cellLuminance.astype(np.uint32) * lastIndex // MAX_PIXEL_VALUE
+  fillCharacters = np.array(list(charset))[fillIndices]
+  edgeCharacters = np.array(EDGE_CHARACTERS)[dominantDirection]
+
+  characters = np.where(
+    dominantCount >= requiredCount, edgeCharacters, fillCharacters
+  )
+  return "\n".join("".join(row) for row in characters)
+
+
 def renderHalfBlock(
   frame: np.ndarray,
   columns: int,
@@ -203,13 +278,20 @@ def renderFrame(
   mode: str,
   columns: int,
   rows: int,
-  charset: str = config.DEFAULT_CHARSET,
+  charset: str | None = None,
   brightness: float = config.DEFAULT_BRIGHTNESS,
   contrast: float = config.DEFAULT_CONTRAST,
 ) -> str:
-  """描画モードに応じてフレームを文字列へ変換する."""
+  """描画モードに応じてフレームを文字列へ変換する.
+
+  charset に None を渡した場合は，モードごとの既定の文字セットを使う.
+  """
+  resolvedCharset = config.charsetFor(mode, charset)
+
   if mode == config.MODE_ASCII:
-    return renderAscii(frame, columns, rows, charset, brightness, contrast)
+    return renderAscii(frame, columns, rows, resolvedCharset, brightness, contrast)
+  if mode == config.MODE_EDGE:
+    return renderEdge(frame, columns, rows, resolvedCharset, brightness, contrast)
   if mode == config.MODE_COLOR:
     return renderHalfBlock(frame, columns, rows, False, brightness, contrast)
   if mode == config.MODE_MONO:
