@@ -22,6 +22,35 @@ def test_formatTime(seconds, expected):
   assert formatTime(seconds) == expected
 
 
+@pytest.mark.parametrize(
+  "rawText, expected",
+  [
+    ("普通のタイトル", "普通のタイトル"),
+    ("危険\x1b[2Jな\x1b[31mタイトル", "危険な タイトル".replace(" ", "")),
+    ("改行\nと\tタブ", "改行とタブ"),
+    ("制御\x07文字", "制御文字"),
+  ],
+)
+def test_sanitizeTextRemovesControlCharacters(rawText, expected):
+  """外部由来の文字列から端末制御文字を取り除くことを確認する."""
+  from fraterm.textwidth import sanitizeText
+
+  assert sanitizeText(rawText) == expected
+
+
+def test_statusLineDoesNotLeakControlCharacters(dummyVideo):
+  """タイトルに仕込まれたANSIコードがステータス行へ出ないことを確認する."""
+  options = PlaybackOptions(title="悪意\x1b[2J\x1b[31mあるタイトル")
+  player = Player(dummyVideo, options, stream=io.StringIO())
+  player._startClock()
+
+  statusText = player._statusText(10, 200)
+  # 自前で付けている装飾以外のエスケープが含まれていないことを確かめる
+  body = statusText.split("H", 1)[1]
+  assert "\x1b[2J" not in body
+  assert "\x1b[31m" not in body
+
+
 def test_displayWidthCountsWideCharacters():
   """全角文字が2文字分として数えられることを確認する."""
   assert displayWidth("abc") == 3
@@ -144,6 +173,325 @@ def test_playRespectsFpsLimit(sampleVideo):
   baseFrames = baseStream.getvalue().count("\x1b[H")
   limitedFrames = limitedStream.getvalue().count("\x1b[H")
   assert limitedFrames < baseFrames
+
+
+class FakeAudioPlayer:
+  """ffplay を起動せず，呼び出し内容だけを記録するテスト用の音声プレイヤー."""
+
+  def __init__(self) -> None:
+    self.starts: list[dict] = []
+    self.stopCount = 0
+
+  def start(self, position=0.0, speed=1.0, volume=config.DEFAULT_VOLUME,
+            effect=config.DEFAULT_AUDIO_EFFECT) -> None:
+    self.starts.append(
+      {"position": position, "speed": speed, "volume": volume, "effect": effect}
+    )
+
+  def stop(self) -> None:
+    self.stopCount += 1
+
+
+def makeAudioPlayer(dummyVideo, **optionValues):
+  """音声を有効にしたプレイヤーと，差し替えた音声プレイヤーを返す."""
+  options = PlaybackOptions(audio=True, **optionValues)
+  player = Player(dummyVideo, options, stream=io.StringIO())
+  fakeAudio = FakeAudioPlayer()
+  player._audioPlayer = fakeAudio
+  player._startClock()
+  return player, fakeAudio
+
+
+def test_audioStartsAtLatencyCompensatedPosition(dummyVideo):
+  """ffplayの起動遅延を見込んだ位置から音声を開始することを確認する."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo)
+  player._syncAudio()
+
+  assert len(fakeAudio.starts) == 1
+  # 現在位置よりも起動遅延の分だけ先を指定している
+  assert fakeAudio.starts[0]["position"] >= config.AUDIO_START_LATENCY
+
+
+def test_audioOffsetShiftsStartPosition(dummyVideo):
+  """--audio-offset の指定が開始位置へ反映されることを確認する."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo, audioOffset=1.5)
+  player._syncAudio()
+
+  assert fakeAudio.starts[0]["position"] >= config.AUDIO_START_LATENCY + 1.5
+
+
+@pytest.mark.parametrize(
+  "effect, expectedFragment",
+  [
+    (config.AUDIO_EFFECT_NONE, ""),
+    (config.AUDIO_EFFECT_8BIT, "acrusher=bits=8"),
+    (config.AUDIO_EFFECT_4BIT, "acrusher=bits=4"),
+  ],
+)
+def test_buildFilterChainForEffects(effect, expectedFragment):
+  """音声の加工がフィルタ指定へ変換されることを確認する."""
+  chain = audio.buildFilterChain(1.0, effect)
+  if expectedFragment:
+    assert expectedFragment in chain
+  else:
+    assert chain == ""
+
+
+def test_buildFilterChainCombinesEffectAndSpeed():
+  """加工と再生速度の指定を同時に組み立てられることを確認する."""
+  chain = audio.buildFilterChain(1.5, config.AUDIO_EFFECT_8BIT)
+
+  assert "acrusher" in chain
+  assert "atempo=1.5" in chain
+  # 加工してから速度を変える順序になっている
+  assert chain.index("acrusher") < chain.index("atempo")
+
+
+def test_audioEffectIsPassedToPlayer(dummyVideo):
+  """再生時に音声の加工が音声プレイヤーへ渡ることを確認する."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo, audioEffect=config.AUDIO_EFFECT_8BIT)
+  player._syncAudio()
+
+  assert fakeAudio.starts[0]["effect"] == config.AUDIO_EFFECT_8BIT
+
+
+def test_effectKeyCyclesThroughChoices(dummyVideo):
+  """eキーで音声の加工が順に切り替わることを確認する."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo)
+  assert player._audioEffect == config.AUDIO_EFFECT_NONE
+
+  for expected in config.AUDIO_EFFECT_CHOICES[1:] + (config.AUDIO_EFFECT_NONE,):
+    player._handleKey("e")
+    assert player._audioEffect == expected
+    assert fakeAudio.starts[-1]["effect"] == expected
+
+
+def test_effectKeyIsIgnoredWithoutAudio(dummyVideo):
+  """音声を使わない再生では加工の切り替えが働かないことを確認する."""
+  player = Player(dummyVideo, PlaybackOptions(), stream=io.StringIO())
+  player._startClock()
+
+  assert player._handleKey("e") is True
+  assert player._audioEffect == config.DEFAULT_AUDIO_EFFECT
+
+
+def test_statusLineShowsAudioEffect(dummyVideo):
+  """ステータス行に，加工中であることが出ることを確認する."""
+  player, _ = makeAudioPlayer(dummyVideo, audioEffect=config.AUDIO_EFFECT_8BIT)
+  assert "8bit" in player._statusText(10, 200)
+
+
+def test_volumeKeysChangeVolume(dummyVideo):
+  """9と0のキーで音量が変わり，音声を鳴らし直すことを確認する."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo, volume=50)
+
+  player._handleKey("0")
+  assert player._volume == 50 + config.VOLUME_STEP
+  assert fakeAudio.starts[-1]["volume"] == player._volume
+
+  player._handleKey("9")
+  assert player._volume == 50
+
+
+def test_volumeIsClamped(dummyVideo):
+  """音量が上下限を超えないことを確認する."""
+  player, _ = makeAudioPlayer(dummyVideo, volume=config.MAX_VOLUME)
+  player._handleKey("0")
+  assert player._volume == config.MAX_VOLUME
+
+  player, _ = makeAudioPlayer(dummyVideo, volume=config.MIN_VOLUME)
+  player._handleKey("9")
+  assert player._volume == config.MIN_VOLUME
+
+
+def test_pauseStopsAudioAndResumeRestarts(dummyVideo):
+  """一時停止で音声が止まり，再開で鳴り直すことを確認する."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo)
+
+  player._handleKey(" ")
+  assert player._paused is True
+  assert fakeAudio.stopCount >= 1
+
+  startsBeforeResume = len(fakeAudio.starts)
+  player._handleKey(" ")
+  assert player._paused is False
+  assert len(fakeAudio.starts) == startsBeforeResume + 1
+
+
+def test_muteStopsAudio(dummyVideo):
+  """mキーで消音でき，もう一度押すと戻ることを確認する."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo)
+
+  player._handleKey("m")
+  assert player._muted is True
+  assert fakeAudio.stopCount >= 1
+
+  startsBeforeUnmute = len(fakeAudio.starts)
+  player._handleKey("m")
+  assert player._muted is False
+  assert len(fakeAudio.starts) == startsBeforeUnmute + 1
+
+
+def test_volumeKeysAreIgnoredWithoutAudio(dummyVideo):
+  """音声を使わない再生では音量キーが何もしないことを確認する."""
+  player = Player(dummyVideo, PlaybackOptions(), stream=io.StringIO())
+  player._startClock()
+
+  assert player._handleKey("0") is True
+  assert player._volume == config.DEFAULT_VOLUME
+
+
+@pytest.mark.parametrize(
+  "rawInput, expected",
+  [
+    ("myclip", (["m", "y", "c", "l", "i", "p"], "")),  # 文字入力はすべて取り出す
+    ("a", (["a"], "")),
+    ("\x1b", ([], "\x1b")),  # Esc単独か続きがあるか未確定のため保留する
+    ("\x1b[A", (["\x1b[A"], "")),  # 矢印キーは操作に使うため取り出す
+    ("ab\x1b[Bcd", (["a", "b", "\x1b[B", "c", "d"], "")),
+    ("\x1b[1;2A", ([], "")),  # 修飾キー付きなど，扱わないシーケンスは読み飛ばす
+    ("\x1b[6~", ([], "")),  # PageDown なども読み飛ばす
+    ("\x1b[", ([], "\x1b[")),  # 途中で切れたシーケンスは持ち越す
+    ("a\x1b[", (["a"], "\x1b[")),
+    ("\r", (["\r"], "")),
+  ],
+)
+def test_keyTokenize(rawInput, expected):
+  """まとめて届いた入力を1キーずつへ分解できることを確認する."""
+  from fraterm.keyboard import KeyReader
+
+  assert KeyReader._tokenize(rawInput) == expected
+
+
+def test_splitEscapeSequenceIsRestored():
+  """読み取りの境界で分断された矢印キーを取りこぼさないことを確認する."""
+  from fraterm.keyboard import KEY_DOWN, KeyReader
+
+  reader = KeyReader()
+  rawInput = KEY_DOWN * 7
+  collected: list[str] = []
+
+  # 端末から8バイトずつ届いた状況を再現する
+  for start in range(0, len(rawInput), 8):
+    key = reader._takeFirst(rawInput[start : start + 8])
+    while key is not None:
+      collected.append(key)
+      key = reader.readKey()
+
+  assert collected == [KEY_DOWN] * 7
+
+
+def test_loneEscapeIsReportedAfterTimeout(monkeypatch):
+  """続きが来なかったEscキーが，少し待ってから確定することを確認する."""
+  from fraterm.keyboard import ESC, KeyReader
+
+  reader = KeyReader()
+  assert reader._takeFirst(ESC) is None  # この時点では確定しない
+  assert reader._flushPartialInput() is None  # 待ち時間が足りない
+
+  reader._partialSince -= 1.0  # 十分な時間が過ぎた状況にする
+  assert reader._flushPartialInput() == ESC
+
+
+def test_arrowKeysAreNotTypedAsText(dummyVideo):
+  """保存名の入力欄に矢印キーの文字列が入らないことを確認する."""
+  from fraterm.keyboard import KEY_DOWN
+
+  savedNames: list[str] = []
+  options = PlaybackOptions(onSave=lambda name: savedNames.append(name) or "保存しました．")
+  player = Player(dummyVideo, options, stream=io.StringIO())
+  player._startClock()
+  player._lastSize = (40, 10, 80, 24)
+  player._keyReader = ScriptedKeyReader(["a", KEY_DOWN, "b", "\r", "x"])
+
+  player._handleKey("s")
+  assert savedNames == ["ab"]
+
+
+def test_pendingKeysAreReturnedInOrder():
+  """余った入力が次回以降の読み取りで順に返ることを確認する."""
+  from fraterm.keyboard import KeyReader
+
+  reader = KeyReader()
+  assert reader._takeFirst("abc") == "a"
+  assert reader.readKey() == "b"
+  assert reader.readKey() == "c"
+  assert reader.readKey() is None
+
+
+def test_saveKeyPromptsAndCallsHandler(dummyVideo):
+  """sキーで保存名を尋ね，入力した名前で保存処理を呼ぶことを確認する."""
+  savedNames: list[str] = []
+
+  options = PlaybackOptions(onSave=lambda name: savedNames.append(name) or "保存しました．")
+  player = Player(dummyVideo, options, stream=io.StringIO())
+  player._startClock()
+  # 画面サイズを確定させ，入力欄を描けるようにする
+  player._lastSize = (40, 10, 80, 24)
+  player._keyReader = ScriptedKeyReader(list("myclip") + ["\r", "x"])
+
+  player._handleKey("s")
+
+  assert savedNames == ["myclip"]
+  assert player._paused is False  # 保存後は再生状態へ戻る
+
+
+def test_saveCanBeCancelledWithEscape(dummyVideo):
+  """Escキーで保存を取り消せることを確認する."""
+  savedNames: list[str] = []
+
+  options = PlaybackOptions(onSave=lambda name: savedNames.append(name) or "保存しました．")
+  player = Player(dummyVideo, options, stream=io.StringIO())
+  player._startClock()
+  player._lastSize = (40, 10, 80, 24)
+  player._keyReader = ScriptedKeyReader(["a", "b", "\x1b"])
+
+  player._handleKey("s")
+  assert savedNames == []
+
+
+def test_saveKeyIsIgnoredWithoutHandler(dummyVideo):
+  """保存処理が設定されていない場合はsキーが何もしないことを確認する."""
+  player = Player(dummyVideo, PlaybackOptions(), stream=io.StringIO())
+  player._startClock()
+  player._keyReader = ScriptedKeyReader(["\r"])
+
+  assert player._handleKey("s") is True
+  assert player._paused is False
+
+
+def test_saveFailureIsShownWithoutStoppingPlayback(dummyVideo):
+  """保存に失敗しても再生が続くことを確認する."""
+  def failingSave(name: str) -> str:
+    raise RuntimeError("書き込みできません")
+
+  player = Player(dummyVideo, PlaybackOptions(onSave=failingSave), stream=io.StringIO())
+  player._startClock()
+  player._lastSize = (40, 10, 80, 24)
+  player._keyReader = ScriptedKeyReader(["x", "\r", "y"])
+
+  assert player._handleKey("s") is True
+  assert player._paused is False
+
+
+def test_signalHandlersAreInstalledAndRestored(dummyVideo):
+  """終了シグナルのハンドラを設定し，後で元へ戻すことを確認する."""
+  import signal
+
+  player = Player(dummyVideo, stream=io.StringIO())
+  original = signal.getsignal(signal.SIGTERM)
+
+  player._installSignalHandlers()
+  assert signal.getsignal(signal.SIGTERM) is player._onTerminationSignal
+
+  player._restoreSignalHandlers()
+  assert signal.getsignal(signal.SIGTERM) is original
+
+
+def test_terminationSignalRaisesInterrupt():
+  """終了シグナルが割り込みとして送出されることを確認する."""
+  with pytest.raises(KeyboardInterrupt):
+    Player._onTerminationSignal(15, None)
 
 
 class ScriptedKeyReader:
