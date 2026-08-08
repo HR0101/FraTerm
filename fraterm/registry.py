@@ -22,24 +22,8 @@ from .errors import (
 # 登録名として許可する文字．先頭は英数字またはアンダースコアとする
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 
-# サブコマンドと衝突する名前は登録できないようにする
-RESERVED_NAMES = frozenset(
-  {
-    "add",
-    "remove",
-    "rm",
-    "delete",
-    "list",
-    "ls",
-    "show",
-    "info",
-    "edit",
-    "play",
-    "run",
-    "help",
-    "version",
-  }
-)
+# サブコマンドと衝突する名前は登録できないようにする（定義は config が一元管理する）
+RESERVED_NAMES = config.RESERVED_NAMES
 
 # 登録名の最大長
 MAX_NAME_LENGTH = 64
@@ -58,6 +42,10 @@ class VideoEntry:
   charset: str | None = None
   brightness: float = config.DEFAULT_BRIGHTNESS
   contrast: float = config.DEFAULT_CONTRAST
+  color: str = config.DEFAULT_COLOR
+  volume: int = config.DEFAULT_VOLUME
+  audioOffset: float = config.DEFAULT_AUDIO_OFFSET
+  audioEffect: str = config.DEFAULT_AUDIO_EFFECT
   # 以下はURLを登録した場合にのみ使用する
   quality: str | None = None
   cache: bool = False
@@ -66,8 +54,9 @@ class VideoEntry:
   cookiesFile: str | None = None
   # YouTubeの取得方法（プレイヤークライアント）の指定
   playerClient: str | None = None
-  # ダウンロード済みファイルの場所（再生時に自動で記録する）
+  # ダウンロード済みファイルの場所と，その取得に使った画質
   cachedPath: str | None = None
+  cachedQuality: str | None = None
 
   def toDict(self) -> dict[str, Any]:
     """JSONへ保存する形式の辞書を返す（登録名はキーになるため含めない）."""
@@ -80,12 +69,17 @@ class VideoEntry:
       "charset": self.charset,
       "brightness": self.brightness,
       "contrast": self.contrast,
+      "color": self.color,
+      "volume": self.volume,
+      "audioOffset": self.audioOffset,
+      "audioEffect": self.audioEffect,
       "quality": self.quality,
       "cache": self.cache,
       "cookiesFromBrowser": self.cookiesFromBrowser,
       "cookiesFile": self.cookiesFile,
       "playerClient": self.playerClient,
       "cachedPath": self.cachedPath,
+      "cachedQuality": self.cachedQuality,
     }
 
   @classmethod
@@ -118,6 +112,20 @@ class VideoEntry:
       charset=data.get("charset") if isinstance(data.get("charset"), str) else None,
       brightness=_floatOrDefault(data.get("brightness"), config.DEFAULT_BRIGHTNESS),
       contrast=_floatOrDefault(data.get("contrast"), config.DEFAULT_CONTRAST),
+      color=(
+        data.get("color")
+        if data.get("color") in config.COLOR_CHOICES
+        else config.DEFAULT_COLOR
+      ),
+      volume=_intInRange(
+        data.get("volume"), config.DEFAULT_VOLUME, config.MIN_VOLUME, config.MAX_VOLUME
+      ),
+      audioOffset=_floatOrDefault(data.get("audioOffset"), config.DEFAULT_AUDIO_OFFSET),
+      audioEffect=(
+        data.get("audioEffect")
+        if data.get("audioEffect") in config.AUDIO_EFFECT_CHOICES
+        else config.DEFAULT_AUDIO_EFFECT
+      ),
       quality=data.get("quality") if isinstance(data.get("quality"), str) else None,
       cache=bool(data.get("cache", False)),
       cookiesFromBrowser=_optionalText(data.get("cookiesFromBrowser")),
@@ -126,6 +134,7 @@ class VideoEntry:
       cachedPath=(
         data.get("cachedPath") if isinstance(data.get("cachedPath"), str) else None
       ),
+      cachedQuality=_optionalText(data.get("cachedQuality")),
     )
 
   def cachedFile(self) -> Path | None:
@@ -174,6 +183,14 @@ def _optionalFloat(value: Any) -> float | None:
 def _optionalText(value: Any) -> str | None:
   """文字列であればそのまま，そうでなければ None を返す."""
   return value if isinstance(value, str) and value else None
+
+
+def _intInRange(value: Any, default: int, minimum: int, maximum: int) -> int:
+  """範囲内の整数へ変換する．変換できない場合は既定値を返す."""
+  converted = _optionalInt(value)
+  if converted is None:
+    return default
+  return max(minimum, min(maximum, converted))
 
 
 def _floatOrDefault(value: Any, default: float) -> float:
