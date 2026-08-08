@@ -31,6 +31,17 @@ EDGE_ANGLE_STEP = np.pi / 4.0
 # 8bit値の上限
 MAX_PIXEL_VALUE = 255
 
+# xterm 256色のうち，6段階の色立方体が始まるインデックス
+COLOR_CUBE_OFFSET = 16
+COLOR_CUBE_STEPS = 5
+
+# 無彩色に割り当てるグレースケール階調（232〜255）の開始位置と段数
+GRAYSCALE_OFFSET = 232
+GRAYSCALE_STEPS = 23
+
+# この差以下ならグレースケール階調として扱う
+GRAYSCALE_TOLERANCE = 12
+
 # True Color対応と判断するCOLORTERMの値
 TRUE_COLOR_HINTS = ("truecolor", "24bit")
 
@@ -59,10 +70,12 @@ def computeSize(
   terminalWidth: int,
   terminalHeight: int,
   maxWidth: int | None = None,
+  reservedRows: int = config.STATUS_ROW_COUNT,
 ) -> tuple[int, int]:
   """動画とターミナルのサイズから，描画する文字数（列数・行数）を求める.
 
   文字セルは正方形ではないため，config.CELL_ASPECT_RATIO で高さを補正する.
+  reservedRows には，ステータス行など描画に使わない行数を渡す.
   """
   if frameWidth <= 0 or frameHeight <= 0:
     raise PlaybackError("動画のフレームサイズを取得できません．")
@@ -70,7 +83,7 @@ def computeSize(
   maxColumns = max(1, terminalWidth)
   if maxWidth is not None and maxWidth > 0:
     maxColumns = min(maxColumns, maxWidth)
-  maxRows = max(1, terminalHeight - config.STATUS_ROW_COUNT)
+  maxRows = max(1, terminalHeight - max(0, reservedRows))
 
   columns = maxColumns
   rows = max(1, round(columns * frameHeight / frameWidth / config.CELL_ASPECT_RATIO))
@@ -112,6 +125,72 @@ def _resize(frame: np.ndarray, columns: int, rows: int) -> np.ndarray:
   return cv2.resize(frame, (columns, rows), interpolation=interpolation)
 
 
+def toXterm256(rgbArray: np.ndarray) -> np.ndarray:
+  """RGB値を xterm 256色のインデックスへ変換する."""
+  values = rgbArray.astype(np.int16)
+  red, green, blue = values[..., 0], values[..., 1], values[..., 2]
+
+  def level(channel: np.ndarray, steps: int) -> np.ndarray:
+    return np.clip(
+      np.rint(channel.astype(np.float32) * steps / MAX_PIXEL_VALUE), 0, steps
+    ).astype(np.int16)
+
+  cubeIndex = (
+    COLOR_CUBE_OFFSET
+    + 36 * level(red, COLOR_CUBE_STEPS)
+    + 6 * level(green, COLOR_CUBE_STEPS)
+    + level(blue, COLOR_CUBE_STEPS)
+  )
+
+  # 彩度が低い画素は，色立方体よりグレースケール階調のほうが滑らかになる
+  isGray = (values.max(axis=-1) - values.min(axis=-1)) <= GRAYSCALE_TOLERANCE
+  grayIndex = GRAYSCALE_OFFSET + level(
+    (red + green + blue) // 3, GRAYSCALE_STEPS
+  )
+
+  return np.where(isGray, grayIndex, cubeIndex)
+
+
+def _colorizeLines(
+  characters: np.ndarray,
+  frame: np.ndarray,
+  columns: int,
+  rows: int,
+  colorMode: str,
+  brightness: float,
+  contrast: float,
+) -> str:
+  """文字の格子に色を付けて，1つの文字列へまとめる."""
+  if colorMode == config.COLOR_OFF:
+    return "\n".join("".join(row) for row in characters)
+
+  colorFrame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR) if frame.ndim == 2 else frame
+  smallFrame = _adjust(_resize(colorFrame, columns, rows), brightness, contrast)
+  # OpenCVはBGR順のため，RGB順へ並べ替える
+  rgbFrame = smallFrame[:, :, ::-1]
+
+  useTrueColor = colorMode == config.COLOR_TRUE
+  colorValues = rgbFrame.tolist() if useTrueColor else toXterm256(rgbFrame).tolist()
+
+  lines: list[str] = []
+  for rowIndex in range(rows):
+    parts: list[str] = []
+    previousColor = None
+    for character, color in zip(characters[rowIndex], colorValues[rowIndex]):
+      # 直前のセルと同じ色ならANSIコードを省略し，出力量を減らす
+      if color != previousColor:
+        if useTrueColor:
+          parts.append(f"{ESC}[38;2;{color[0]};{color[1]};{color[2]}m")
+        else:
+          parts.append(f"{ESC}[38;5;{color}m")
+        previousColor = color
+      parts.append(character)
+    parts.append(RESET)
+    lines.append("".join(parts))
+
+  return "\n".join(lines)
+
+
 def renderAscii(
   frame: np.ndarray,
   columns: int,
@@ -119,6 +198,7 @@ def renderAscii(
   charset: str = config.DEFAULT_CHARSET,
   brightness: float = config.DEFAULT_BRIGHTNESS,
   contrast: float = config.DEFAULT_CONTRAST,
+  colorMode: str = config.DEFAULT_COLOR,
 ) -> str:
   """フレームをグレースケール化し，明るさに応じたASCII文字へ変換する."""
   if not charset:
@@ -131,11 +211,14 @@ def renderAscii(
   lastIndex = len(charset) - 1
   if lastIndex <= 0:
     # 1文字しかない文字セットでも例外にせず，その文字で埋める
-    return "\n".join(charset * columns for _ in range(rows))
+    characters = np.full((rows, columns), charset, dtype="<U1")
+  else:
+    indices = smallFrame.astype(np.uint32) * lastIndex // MAX_PIXEL_VALUE
+    characters = characterTable[indices]
 
-  indices = smallFrame.astype(np.uint32) * lastIndex // MAX_PIXEL_VALUE
-  characters = characterTable[indices]
-  return "\n".join("".join(row) for row in characters)
+  return _colorizeLines(
+    characters, frame, columns, rows, colorMode, brightness, contrast
+  )
 
 
 def renderEdge(
@@ -145,6 +228,7 @@ def renderEdge(
   charset: str = config.DEFAULT_EDGE_CHARSET,
   brightness: float = config.DEFAULT_BRIGHTNESS,
   contrast: float = config.DEFAULT_CONTRAST,
+  colorMode: str = config.DEFAULT_COLOR,
 ) -> str:
   """輪郭を検出し，線の向きに応じた記号で描画する（白黒）.
 
@@ -203,7 +287,9 @@ def renderEdge(
   characters = np.where(
     dominantCount >= requiredCount, edgeCharacters, fillCharacters
   )
-  return "\n".join("".join(row) for row in characters)
+  return _colorizeLines(
+    characters, frame, columns, rows, colorMode, brightness, contrast
+  )
 
 
 def renderHalfBlock(
@@ -281,17 +367,23 @@ def renderFrame(
   charset: str | None = None,
   brightness: float = config.DEFAULT_BRIGHTNESS,
   contrast: float = config.DEFAULT_CONTRAST,
+  colorMode: str = config.DEFAULT_COLOR,
 ) -> str:
   """描画モードに応じてフレームを文字列へ変換する.
 
   charset に None を渡した場合は，モードごとの既定の文字セットを使う.
+  colorMode は文字で描くモード（ascii・edge）でのみ有効である.
   """
   resolvedCharset = config.charsetFor(mode, charset)
 
   if mode == config.MODE_ASCII:
-    return renderAscii(frame, columns, rows, resolvedCharset, brightness, contrast)
+    return renderAscii(
+      frame, columns, rows, resolvedCharset, brightness, contrast, colorMode
+    )
   if mode == config.MODE_EDGE:
-    return renderEdge(frame, columns, rows, resolvedCharset, brightness, contrast)
+    return renderEdge(
+      frame, columns, rows, resolvedCharset, brightness, contrast, colorMode
+    )
   if mode == config.MODE_COLOR:
     return renderHalfBlock(frame, columns, rows, False, brightness, contrast)
   if mode == config.MODE_MONO:
