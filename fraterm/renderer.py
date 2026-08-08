@@ -85,16 +85,30 @@ def computeSize(
     maxColumns = min(maxColumns, maxWidth)
   maxRows = max(1, terminalHeight - max(0, reservedRows))
 
-  columns = maxColumns
-  rows = max(1, round(columns * frameHeight / frameWidth / config.CELL_ASPECT_RATIO))
+  # 横幅を使い切る場合と縦幅を使い切る場合の両方を候補にする．
+  # 片方だけを先に決めると，縦長・横長の動画で反対側を1セル余らせやすい．
+  widthLimitedRows = max(
+    1,
+    round(maxColumns * frameHeight / frameWidth / config.CELL_ASPECT_RATIO),
+  )
+  heightLimitedColumns = max(
+    1,
+    round(maxRows * config.CELL_ASPECT_RATIO * frameWidth / frameHeight),
+  )
 
-  # 高さが画面に収まらない場合は，行数を基準に列数を計算し直す
-  if rows > maxRows:
-    rows = maxRows
-    columns = max(1, round(rows * config.CELL_ASPECT_RATIO * frameWidth / frameHeight))
-    columns = min(columns, maxColumns)
+  candidates: list[tuple[int, int]] = []
+  if widthLimitedRows <= maxRows:
+    candidates.append((maxColumns, widthLimitedRows))
+  if heightLimitedColumns <= maxColumns:
+    candidates.append((heightLimitedColumns, maxRows))
 
-  return columns, rows
+  # 正常な正の寸法なら通常どちらかが候補になる．極端な丸めでも，
+  # 端末内に収まる最小サイズを返して再生自体は継続できるようにする．
+  if not candidates:
+    candidates.append((1, 1))
+
+  # 表示面積が最大の候補を選び，同面積なら横幅を優先する．
+  return max(candidates, key=lambda size: (size[0] * size[1], size[0]))
 
 
 def pixelHeightFor(rows: int, mode: str) -> int:

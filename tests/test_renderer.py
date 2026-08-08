@@ -34,6 +34,30 @@ def test_computeSizeFitsInTerminalHeight():
   assert columns <= 200
 
 
+@pytest.mark.parametrize(
+  "frameWidth, frameHeight, expectedFullDimension",
+  [
+    (1920, 1080, "width"),
+    (1080, 1920, "height"),
+  ],
+)
+def test_computeSizeMaximizesTheLimitingDimension(
+  frameWidth, frameHeight, expectedFullDimension
+):
+  """横長・縦長のどちらでも，収まる側の寸法を最大限使うことを確認する."""
+  terminalWidth, terminalHeight = 80, 24
+  columns, rows = renderer.computeSize(
+    frameWidth, frameHeight, terminalWidth, terminalHeight
+  )
+
+  if expectedFullDimension == "width":
+    assert columns == terminalWidth
+    assert rows < terminalHeight - config.STATUS_ROW_COUNT
+  else:
+    assert rows == terminalHeight - config.STATUS_ROW_COUNT
+    assert columns < terminalWidth
+
+
 def test_computeSizeUsesAllRowsWithoutStatusLine():
   """ステータス行を出さない場合は，その1行も描画に使うことを確認する."""
   terminalHeight = 20
