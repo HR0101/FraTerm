@@ -406,6 +406,80 @@ def test_partialFileIsNotReusedAsCache(isolatedHome, monkeypatch):
   assert not result.with_name(result.name + source.PARTIAL_SUFFIX).exists()
 
 
+def test_downloadResumesAfterConnectionLoss(isolatedHome, monkeypatch):
+  """通信が切れても，続きから取得して保存できることを確認する."""
+  cachePath = isolatedHome / config.CACHE_DIR_NAME / "resume.mp4"
+  cachePath.parent.mkdir(parents=True, exist_ok=True)
+  partialPath = cachePath.with_name(cachePath.name + source.PARTIAL_SUFFIX)
+
+  attempts = {"count": 0}
+
+  def fakeRun(arguments, timeout):
+    attempts["count"] += 1
+    # 中断した位置から再開できるよう指定している
+    assert "--continue" in arguments
+    if attempts["count"] < source.DOWNLOAD_ATTEMPTS:
+      partialPath.write_bytes(b"\x00" * 100)  # 途中まで取得した状態
+      raise SourceError("接続が切れました")
+    partialPath.write_bytes(b"\x00" * (source.MIN_CACHE_FILE_SIZE + 1))
+    return makeCompletedProcess()
+
+  monkeypatch.setattr(source, "runYtdlp", fakeRun)
+
+  messages: list[str] = []
+  result = source.downloadToCache(SAMPLE_URL, "480", cachePath, messages.append)
+
+  assert attempts["count"] == source.DOWNLOAD_ATTEMPTS
+  assert result.stat().st_size > source.MIN_CACHE_FILE_SIZE
+  assert not partialPath.exists()
+  assert any("再開します" in message for message in messages)
+
+
+def test_downloadGivesUpAfterRepeatedFailures(isolatedHome, monkeypatch):
+  """繰り返し失敗した場合は，残骸を消して分かりやすいエラーにすることを確認する."""
+  cachePath = isolatedHome / config.CACHE_DIR_NAME / "broken.mp4"
+  cachePath.parent.mkdir(parents=True, exist_ok=True)
+  partialPath = cachePath.with_name(cachePath.name + source.PARTIAL_SUFFIX)
+
+  attempts = {"count": 0}
+
+  def alwaysFail(arguments, timeout):
+    attempts["count"] += 1
+    partialPath.write_bytes(b"\x00" * 100)
+    raise SourceError("接続が切れました")
+
+  monkeypatch.setattr(source, "runYtdlp", alwaysFail)
+
+  with pytest.raises(SourceError) as errorInfo:
+    source.downloadToCache(SAMPLE_URL, "480", cachePath)
+
+  assert attempts["count"] == source.DOWNLOAD_ATTEMPTS
+  assert "ダウンロードできませんでした" in errorInfo.value.message
+  assert "通信が不安定" in (errorInfo.value.hint or "")
+  assert not partialPath.exists()
+
+
+def test_downloadPassesNetworkRetryOptions(isolatedHome, monkeypatch):
+  """yt-dlp 自身にも再試行させる指定を渡すことを確認する."""
+  cachePath = isolatedHome / config.CACHE_DIR_NAME / "options.mp4"
+  cachePath.parent.mkdir(parents=True, exist_ok=True)
+  captured: list[str] = []
+
+  def fakeRun(arguments, timeout):
+    captured.extend(arguments)
+    cachePath.with_name(cachePath.name + source.PARTIAL_SUFFIX).write_bytes(
+      b"\x00" * (source.MIN_CACHE_FILE_SIZE + 1)
+    )
+    return makeCompletedProcess()
+
+  monkeypatch.setattr(source, "runYtdlp", fakeRun)
+  source.downloadToCache(SAMPLE_URL, "480", cachePath)
+
+  assert "--retries" in captured
+  assert "--fragment-retries" in captured
+  assert "--socket-timeout" in captured
+
+
 def test_incompleteDownloadRaisesAndCleansUp(isolatedHome, monkeypatch):
   """ダウンロードが不完全なら，残骸を消してエラーにすることを確認する."""
   cachePath = isolatedHome / config.CACHE_DIR_NAME / "tiny.mp4"
