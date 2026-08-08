@@ -12,6 +12,7 @@ from typing import TextIO
 from . import audio as audioModule
 from . import config, renderer
 from .errors import PlaybackError, VideoFileError
+from .frame_reader import FrameReader
 from .keyboard import KeyReader
 from .registry import VideoEntry
 from .textwidth import truncateToWidth
@@ -102,6 +103,7 @@ class Player:
 
     # 再生中に使用する内部状態
     self._capture = None
+    self._frameReader: FrameReader | None = None
     self._videoFps = config.FALLBACK_FPS
     self._duration = 0.0
     self._nextFrameIndex = 0
@@ -142,6 +144,8 @@ class Player:
     if self._duration <= 0 and self.options.duration:
       # ストリーミング再生ではフレーム数を取得できないため，取得済みの情報を使う
       self._duration = float(self.options.duration)
+    # デコードを描画スレッドから分離し，端末出力の一時的な遅延を吸収する
+    self._frameReader = FrameReader(capture)
 
     try:
       self._prepareTerminal()
@@ -152,6 +156,9 @@ class Player:
     finally:
       if self._audioPlayer is not None:
         self._audioPlayer.stop()
+      if self._frameReader is not None:
+        self._frameReader.close()
+        self._frameReader = None
       capture.release()
       self._capture = None
       self._restoreTerminal()
@@ -279,6 +286,12 @@ class Player:
 
   def _grabFrame(self) -> bool:
     """フレームをデコードせずに1つ読み進める."""
+    if self._frameReader is not None:
+      packet = self._frameReader.read()
+      if packet is None:
+        return False
+      self._nextFrameIndex = packet[0] + 1
+      return True
     if self._capture is None or not self._capture.grab():
       return False
     self._nextFrameIndex += 1
@@ -286,6 +299,13 @@ class Player:
 
   def _readFrame(self):
     """フレームを1つ読み込む．動画の終端では None を返す."""
+    if self._frameReader is not None:
+      packet = self._frameReader.read()
+      if packet is None:
+        return None
+      frameIndex, frame = packet
+      self._nextFrameIndex = frameIndex + 1
+      return frame
     if self._capture is None:
       return None
     isRead, frame = self._capture.read()
@@ -341,7 +361,9 @@ class Player:
     """再生位置を先頭へ戻す."""
     import cv2
 
-    if self._capture is not None:
+    if self._frameReader is not None:
+      self._frameReader.seek(cv2.CAP_PROP_POS_FRAMES)
+    elif self._capture is not None:
       self._capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
     self._nextFrameIndex = 0
     self._lastRenderedMedia = None
