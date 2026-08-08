@@ -91,12 +91,31 @@ def test_playbackOptionsFromEntry(dummyVideo):
   assert options.title == "sample"
 
 
-def test_quitKeyStopsPlayback(dummyVideo):
-  """q キーが再生終了を要求することを確認する."""
+@pytest.mark.parametrize("key", ["q", "Q", "\x1b", "\x03"])
+def test_quitKeysStopPlayback(dummyVideo, key):
+  """q・Esc・Ctrl+C が再生終了を要求することを確認する."""
   player = Player(dummyVideo)
-  assert player._handleKey("q") is False
-  assert player._handleKey("Q") is False
+  assert player._handleKey(key) is False
+
+
+def test_otherKeysContinuePlayback(dummyVideo):
+  """終了以外のキーでは再生が続くことを確認する."""
+  player = Player(dummyVideo)
   assert player._handleKey("x") is True
+
+
+def test_escapeCancelsSaveInsteadOfQuitting(dummyVideo):
+  """保存名の入力中は，Escが終了ではなく取り消しになることを確認する."""
+  savedNames: list[str] = []
+  options = PlaybackOptions(onSave=lambda name: savedNames.append(name) or "保存しました．")
+  player = Player(dummyVideo, options, stream=io.StringIO())
+  player._startClock()
+  player._lastSize = (40, 10, 80, 24)
+  player._keyReader = ScriptedKeyReader(["a", "\x1b", "x"])
+
+  # s を押しても再生は終了せず，Escで入力だけが取り消される
+  assert player._handleKey("s") is True
+  assert savedNames == []
 
 
 def test_pauseFreezesMediaTime(dummyVideo):
@@ -182,11 +201,8 @@ class FakeAudioPlayer:
     self.starts: list[dict] = []
     self.stopCount = 0
 
-  def start(self, position=0.0, speed=1.0, volume=config.DEFAULT_VOLUME,
-            effect=config.DEFAULT_AUDIO_EFFECT) -> None:
-    self.starts.append(
-      {"position": position, "speed": speed, "volume": volume, "effect": effect}
-    )
+  def start(self, position=0.0, speed=1.0, volume=config.DEFAULT_VOLUME) -> None:
+    self.starts.append({"position": position, "speed": speed, "volume": volume})
 
   def stop(self) -> None:
     self.stopCount += 1
@@ -218,67 +234,6 @@ def test_audioOffsetShiftsStartPosition(dummyVideo):
   player._syncAudio()
 
   assert fakeAudio.starts[0]["position"] >= config.AUDIO_START_LATENCY + 1.5
-
-
-@pytest.mark.parametrize(
-  "effect, expectedFragment",
-  [
-    (config.AUDIO_EFFECT_NONE, ""),
-    (config.AUDIO_EFFECT_8BIT, "acrusher=bits=8"),
-    (config.AUDIO_EFFECT_4BIT, "acrusher=bits=4"),
-  ],
-)
-def test_buildFilterChainForEffects(effect, expectedFragment):
-  """音声の加工がフィルタ指定へ変換されることを確認する."""
-  chain = audio.buildFilterChain(1.0, effect)
-  if expectedFragment:
-    assert expectedFragment in chain
-  else:
-    assert chain == ""
-
-
-def test_buildFilterChainCombinesEffectAndSpeed():
-  """加工と再生速度の指定を同時に組み立てられることを確認する."""
-  chain = audio.buildFilterChain(1.5, config.AUDIO_EFFECT_8BIT)
-
-  assert "acrusher" in chain
-  assert "atempo=1.5" in chain
-  # 加工してから速度を変える順序になっている
-  assert chain.index("acrusher") < chain.index("atempo")
-
-
-def test_audioEffectIsPassedToPlayer(dummyVideo):
-  """再生時に音声の加工が音声プレイヤーへ渡ることを確認する."""
-  player, fakeAudio = makeAudioPlayer(dummyVideo, audioEffect=config.AUDIO_EFFECT_8BIT)
-  player._syncAudio()
-
-  assert fakeAudio.starts[0]["effect"] == config.AUDIO_EFFECT_8BIT
-
-
-def test_effectKeyCyclesThroughChoices(dummyVideo):
-  """eキーで音声の加工が順に切り替わることを確認する."""
-  player, fakeAudio = makeAudioPlayer(dummyVideo)
-  assert player._audioEffect == config.AUDIO_EFFECT_NONE
-
-  for expected in config.AUDIO_EFFECT_CHOICES[1:] + (config.AUDIO_EFFECT_NONE,):
-    player._handleKey("e")
-    assert player._audioEffect == expected
-    assert fakeAudio.starts[-1]["effect"] == expected
-
-
-def test_effectKeyIsIgnoredWithoutAudio(dummyVideo):
-  """音声を使わない再生では加工の切り替えが働かないことを確認する."""
-  player = Player(dummyVideo, PlaybackOptions(), stream=io.StringIO())
-  player._startClock()
-
-  assert player._handleKey("e") is True
-  assert player._audioEffect == config.DEFAULT_AUDIO_EFFECT
-
-
-def test_statusLineShowsAudioEffect(dummyVideo):
-  """ステータス行に，加工中であることが出ることを確認する."""
-  player, _ = makeAudioPlayer(dummyVideo, audioEffect=config.AUDIO_EFFECT_8BIT)
-  assert "8bit" in player._statusText(10, 200)
 
 
 def test_volumeKeysChangeVolume(dummyVideo):

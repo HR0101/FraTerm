@@ -34,7 +34,7 @@ DIM = f"{ESC}[2m"
 TERMINATION_SIGNALS = ("SIGTERM", "SIGHUP")
 
 # 再生中に表示する操作説明
-KEY_HELP = "[q]終了 [space]停止 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [e]音質 [s]保存"
+KEY_HELP = "[q/Esc]終了 [space]一時停止 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [s]保存"
 
 # 保存名として受け付ける最大文字数
 MAX_INPUT_LENGTH = 40
@@ -70,8 +70,6 @@ class PlaybackOptions:
   volume: int = config.DEFAULT_VOLUME
   # 音声が遅れて聞こえる場合に前後させる秒数
   audioOffset: float = config.DEFAULT_AUDIO_OFFSET
-  # 音声の加工（8bit風など）
-  audioEffect: str = config.DEFAULT_AUDIO_EFFECT
   title: str = ""
   # 動画から長さを取得できない場合（URL再生など）に使用する再生時間
   duration: float | None = None
@@ -92,7 +90,6 @@ class PlaybackOptions:
       color=entry.color,
       volume=entry.volume,
       audioOffset=entry.audioOffset,
-      audioEffect=entry.audioEffect,
       title=entry.name,
     )
 
@@ -129,7 +126,6 @@ class Player:
     self._paused = False
     self._muted = not self.options.audio
     self._volume = self.options.volume
-    self._audioEffect = self.options.audioEffect
     self._mediaBase = 0.0
     self._clockStart = 0.0
 
@@ -298,7 +294,6 @@ class Player:
       position=startPosition,
       speed=self._speed,
       volume=self._volume,
-      effect=self._audioEffect,
     )
 
   # -------------------------------------------------------------------------
@@ -409,7 +404,8 @@ class Player:
     """キー入力に応じて再生状態を変更する．終了する場合は偽を返す."""
     lowerKey = key.lower()
 
-    if lowerKey == "q" or key == "\x03":  # Ctrl+C も終了として扱う
+    # Esc と Ctrl+C も終了として扱う（保存名の入力中は取り消しが優先される）
+    if lowerKey == "q" or key == ESC or key == "\x03":
       return False
 
     if key == " ":
@@ -442,10 +438,6 @@ class Player:
 
     if lowerKey == "s":
       self._saveInteractively()
-      return True
-
-    if lowerKey == "e":
-      self._cycleAudioEffect()
       return True
 
     return True
@@ -554,16 +546,6 @@ class Player:
     _, rows, terminalWidth, _ = self._lastSize
     body = truncateToWidth(sanitizeText(text), max(0, terminalWidth))
     self._write(f"{ESC}[{rows + 1};1H{body}{RESET_ATTRIBUTES}{CLEAR_LINE}")
-
-  def _cycleAudioEffect(self) -> None:
-    """音声の加工を順に切り替える．音声を使わない再生では何もしない."""
-    if self._audioPlayer is None:
-      return
-
-    choices = config.AUDIO_EFFECT_CHOICES
-    currentIndex = choices.index(self._audioEffect) if self._audioEffect in choices else 0
-    self._audioEffect = choices[(currentIndex + 1) % len(choices)]
-    self._syncAudio()
 
   def _changeVolume(self, delta: int) -> None:
     """音量を変更する．音声を使わない再生では何もしない."""
@@ -694,8 +676,6 @@ class Player:
       audioState = "消音"
     else:
       audioState = f"{self._volume}%"
-      if self._audioEffect != config.AUDIO_EFFECT_NONE:
-        audioState += f"/{self._audioEffect}"
     # 動画のタイトルは外部由来のため，制御文字を取り除いてから表示する
     title = sanitizeText(self.options.title or Path(self.videoPath).name)
 
