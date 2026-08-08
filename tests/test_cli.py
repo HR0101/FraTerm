@@ -139,13 +139,66 @@ def test_editUpdatesSettings(dummyVideo, capsys):
   assert entry.audio is True
 
 
-def test_editWithoutChangesShowsError(dummyVideo, capsys):
-  """変更内容を指定しない edit がエラーになることを確認する."""
+def test_editWithoutOptionsOpensEditor(dummyVideo, monkeypatch, capsys):
+  """オプション無しの edit で編集画面が開くことを確認する."""
+  from fraterm import editor
+
+  opened: list[str] = []
+  monkeypatch.setattr(editor, "editEntry", lambda name, stream=None: opened.append(name))
+
   cli.main(["add", "sample", str(dummyVideo)])
   capsys.readouterr()
 
-  assert cli.main(["edit", "sample"]) == cli.EXIT_ERROR
-  assert "変更する項目" in capsys.readouterr().err
+  assert cli.main(["edit", "sample"]) == cli.EXIT_OK
+  assert opened == ["sample"]
+
+
+def test_editUnknownNameShowsSuggestion(dummyVideo, capsys):
+  """存在しない名前を編集しようとすると候補が出ることを確認する."""
+  cli.main(["add", "sample", str(dummyVideo)])
+  capsys.readouterr()
+
+  assert cli.main(["edit", "sanple"]) == cli.EXIT_ERROR
+  assert "もしかして" in capsys.readouterr().err
+
+
+def test_unknownNameSuggestsSimilarEntry(dummyVideo, capsys):
+  """再生時にも似た登録名を提案することを確認する."""
+  cli.main(["add", "myvideo", str(dummyVideo)])
+  capsys.readouterr()
+
+  assert cli.main(["myvide"]) == cli.EXIT_ERROR
+  errorOutput = capsys.readouterr().err
+  assert "もしかして" in errorOutput
+  assert "myvideo" in errorOutput
+
+
+def test_mistypedCommandSuggestsCommand(capsys):
+  """コマンド名の打ち間違いに，コマンドの候補が出ることを確認する."""
+  assert cli.main(["lst"]) == cli.EXIT_ERROR
+  errorOutput = capsys.readouterr().err
+  assert "コマンド名の打ち間違い" in errorOutput
+  assert "list" in errorOutput
+
+
+def test_welcomeMessageWithoutArguments(capsys):
+  """引数なしのとき，最初の一歩の案内が出ることを確認する."""
+  assert cli.main([]) == cli.EXIT_OK
+  output = capsys.readouterr().out
+
+  assert "はじめての方は" in output
+  assert "menu" in output
+
+
+def test_welcomeMessageListsRegisteredNames(dummyVideo, capsys):
+  """登録がある場合は，その件数と名前が案内に出ることを確認する."""
+  cli.main(["add", "sample", str(dummyVideo)])
+  capsys.readouterr()
+
+  cli.main([])
+  output = capsys.readouterr().out
+  assert "登録済み（1件）" in output
+  assert "sample" in output
 
 
 def test_editCanResetWidthToAuto(dummyVideo):

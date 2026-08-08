@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -28,6 +29,9 @@ RESERVED_NAMES = config.RESERVED_NAMES
 # 登録名の最大長
 MAX_NAME_LENGTH = 64
 
+# 打ち間違いの候補とみなす類似度
+SIMILARITY_CUTOFF = 0.6
+
 
 @dataclass(frozen=True)
 class VideoEntry:
@@ -39,13 +43,13 @@ class VideoEntry:
   audio: bool = False
   width: int | None = None
   fps: float | None = None
+  preRender: bool = False
   charset: str | None = None
   brightness: float = config.DEFAULT_BRIGHTNESS
   contrast: float = config.DEFAULT_CONTRAST
   color: str = config.DEFAULT_COLOR
   volume: int = config.DEFAULT_VOLUME
   audioOffset: float = config.DEFAULT_AUDIO_OFFSET
-  audioEffect: str = config.DEFAULT_AUDIO_EFFECT
   # 以下はURLを登録した場合にのみ使用する
   quality: str | None = None
   cache: bool = False
@@ -66,13 +70,13 @@ class VideoEntry:
       "audio": self.audio,
       "width": self.width,
       "fps": self.fps,
+      "preRender": self.preRender,
       "charset": self.charset,
       "brightness": self.brightness,
       "contrast": self.contrast,
       "color": self.color,
       "volume": self.volume,
       "audioOffset": self.audioOffset,
-      "audioEffect": self.audioEffect,
       "quality": self.quality,
       "cache": self.cache,
       "cookiesFromBrowser": self.cookiesFromBrowser,
@@ -109,6 +113,7 @@ class VideoEntry:
       audio=bool(data.get("audio", False)),
       width=_optionalInt(data.get("width")),
       fps=_optionalFloat(data.get("fps")),
+      preRender=bool(data.get("preRender", False)),
       charset=data.get("charset") if isinstance(data.get("charset"), str) else None,
       brightness=_floatOrDefault(data.get("brightness"), config.DEFAULT_BRIGHTNESS),
       contrast=_floatOrDefault(data.get("contrast"), config.DEFAULT_CONTRAST),
@@ -121,11 +126,6 @@ class VideoEntry:
         data.get("volume"), config.DEFAULT_VOLUME, config.MIN_VOLUME, config.MAX_VOLUME
       ),
       audioOffset=_floatOrDefault(data.get("audioOffset"), config.DEFAULT_AUDIO_OFFSET),
-      audioEffect=(
-        data.get("audioEffect")
-        if data.get("audioEffect") in config.AUDIO_EFFECT_CHOICES
-        else config.DEFAULT_AUDIO_EFFECT
-      ),
       quality=data.get("quality") if isinstance(data.get("quality"), str) else None,
       cache=bool(data.get("cache", False)),
       cookiesFromBrowser=_optionalText(data.get("cookiesFromBrowser")),
@@ -197,6 +197,24 @@ def _floatOrDefault(value: Any, default: float) -> float:
   """実数へ変換できない場合は既定値を返す."""
   converted = _optionalFloat(value)
   return default if converted is None else converted
+
+
+def similarNames(target: str, candidates: list[str], limit: int = 3) -> list[str]:
+  """打ち間違いと思われる候補を，似ている順に返す."""
+  return difflib.get_close_matches(target, candidates, n=limit, cutoff=SIMILARITY_CUTOFF)
+
+
+def notFoundError(name: str, candidates: list[str]) -> NameNotFoundError:
+  """未登録の名前に対して，候補を添えたエラーを組み立てる."""
+  hints: list[str] = []
+
+  suggestions = similarNames(name, candidates)
+  if suggestions:
+    quoted = "，".join(f"「{candidate}」" for candidate in suggestions)
+    hints.append(f"もしかして: {quoted}")
+
+  hints.append(f"登録一覧は `{config.commandName()} list` で確認できます．")
+  return NameNotFoundError(f"「{name}」は登録されていません．", hint="\n".join(hints))
 
 
 def validateName(name: str) -> None:
@@ -338,10 +356,7 @@ class Registry:
     """登録名から登録情報を取得する．存在しない場合は例外を送出する."""
     entries = self.load()
     if name not in entries:
-      raise NameNotFoundError(
-        f"「{name}」は登録されていません．",
-        hint=f"登録一覧は `{config.commandName()} list` で確認できます．",
-      )
+      raise notFoundError(name, sorted(entries))
     return entries[name]
 
   def add(self, entry: VideoEntry, force: bool = False) -> VideoEntry:
@@ -363,10 +378,7 @@ class Registry:
     """登録済みの設定を部分的に変更する."""
     entries = self.load()
     if name not in entries:
-      raise NameNotFoundError(
-        f"「{name}」は登録されていません．",
-        hint=f"登録一覧は `{config.commandName()} list` で確認できます．",
-      )
+      raise notFoundError(name, sorted(entries))
 
     updatedEntry = replace(entries[name], **changes)
     entries[name] = updatedEntry
@@ -377,10 +389,7 @@ class Registry:
     """登録を削除する．動画ファイル自体は削除しない."""
     entries = self.load()
     if name not in entries:
-      raise NameNotFoundError(
-        f"「{name}」は登録されていません．",
-        hint=f"登録一覧は `{config.commandName()} list` で確認できます．",
-      )
+      raise notFoundError(name, sorted(entries))
 
     removedEntry = entries.pop(name)
     self.save(entries)

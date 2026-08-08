@@ -34,6 +34,30 @@ def test_computeSizeFitsInTerminalHeight():
   assert columns <= 200
 
 
+@pytest.mark.parametrize(
+  "frameWidth, frameHeight, expectedFullDimension",
+  [
+    (1920, 1080, "width"),
+    (1080, 1920, "height"),
+  ],
+)
+def test_computeSizeMaximizesTheLimitingDimension(
+  frameWidth, frameHeight, expectedFullDimension
+):
+  """横長・縦長のどちらでも，収まる側の寸法を最大限使うことを確認する."""
+  terminalWidth, terminalHeight = 80, 24
+  columns, rows = renderer.computeSize(
+    frameWidth, frameHeight, terminalWidth, terminalHeight
+  )
+
+  if expectedFullDimension == "width":
+    assert columns == terminalWidth
+    assert rows < terminalHeight - config.STATUS_ROW_COUNT
+  else:
+    assert rows == terminalHeight - config.STATUS_ROW_COUNT
+    assert columns < terminalWidth
+
+
 def test_computeSizeUsesAllRowsWithoutStatusLine():
   """ステータス行を出さない場合は，その1行も描画に使うことを確認する."""
   terminalHeight = 20
@@ -56,6 +80,43 @@ def test_computeSizeRejectsEmptyFrame():
   """フレームサイズが不正な場合にエラーになることを確認する."""
   with pytest.raises(PlaybackError):
     renderer.computeSize(0, 0, 80, 24)
+
+
+def test_detectLetterboxReturnsActiveImageBounds():
+  """上下の黒帯を除いた映像領域を検出できることを確認する."""
+  frame = np.full((100, 200, 3), 180, dtype=np.uint8)
+  frame[:15] = 0
+  frame[-15:] = 0
+
+  assert renderer.detectLetterbox(frame) == (15, 85)
+
+
+def test_detectBlackBordersReturnsAllSides():
+  """上下左右すべての黒帯を検出できることを確認する."""
+  frame = np.full((100, 200, 3), 180, dtype=np.uint8)
+  frame[:10] = 0
+  frame[-10:] = 0
+  frame[:, :20] = 0
+  frame[:, -20:] = 0
+
+  assert renderer.detectBlackBorders(frame) == (10, 90, 20, 180)
+
+
+def test_detectLetterboxToleratesSubtitleInBlackBar():
+  """黒帯内の字幕のような明るい画素を許容することを確認する."""
+  frame = np.full((100, 200, 3), 180, dtype=np.uint8)
+  frame[:15] = 0
+  frame[-15:] = 0
+  frame[-8, 20:80] = 255
+
+  assert renderer.detectLetterbox(frame) == (15, 85)
+
+
+def test_detectLetterboxKeepsUniformDarkFrame():
+  """全体が暗い映像を黒帯として切り取らないことを確認する."""
+  frame = np.full((100, 200, 3), 8, dtype=np.uint8)
+
+  assert renderer.detectLetterbox(frame) == (0, 100)
 
 
 def test_pixelHeightForModes():

@@ -83,6 +83,10 @@ SETTING_ITEMS: tuple[SettingItem, ...] = (
     step=5, minimum=1, maximum=120, base=30,
   ),
   SettingItem(
+    "preRender", "再生前に事前生成", "bool",
+    "全フレームを先に文字列化して再生中の変換遅延を抑える",
+  ),
+  SettingItem(
     "brightness", "明るさ", "text", "-1.0 〜 1.0 の補正値",
     step=0.1, minimum=-1.0, maximum=1.0, base=0.0, decimals=2,
   ),
@@ -100,13 +104,6 @@ SETTING_ITEMS: tuple[SettingItem, ...] = (
     "audioOffset", "音声のずれ補正", "text", "秒．正の値で音声が先行",
     step=0.1, minimum=config.MIN_AUDIO_OFFSET, maximum=config.MAX_AUDIO_OFFSET,
     base=0.0, decimals=2,
-  ),
-  SettingItem(
-    "audioEffect",
-    "音声の加工",
-    "choice",
-    "レトロゲーム風の音にする",
-    config.AUDIO_EFFECT_CHOICES,
   ),
   SettingItem("quality", "URLの画質", "choice", "URL再生時に取得する画質", config.QUALITY_CHOICES),
   SettingItem("cache", "URLを保存して再生", "bool", "ダウンロードしてから再生する"),
@@ -152,14 +149,13 @@ VALUE_DESCRIPTIONS: dict[str, dict[Any, str]] = {
     True: "ffplay で音声も鳴らします",
     False: "音声を鳴らしません",
   },
+  "preRender": {
+    True: "再生開始前に全フレームを生成し，途中のカクつきを抑えます",
+    False: "再生しながらフレームを変換します",
+  },
   "cache": {
     True: "ダウンロードしてから再生します．次回からオフラインでも見られます",
     False: "ダウンロードせず直接ストリーミングします",
-  },
-  "audioEffect": {
-    config.AUDIO_EFFECT_NONE: "加工しません．元の音のまま再生します",
-    config.AUDIO_EFFECT_8BIT: "8bit相当まで粗くします．レトロゲーム風の音になります",
-    config.AUDIO_EFFECT_4BIT: "4bit相当までさらに粗くします．ざらついた強い効果です",
   },
 }
 
@@ -203,7 +199,7 @@ def usageLines() -> list[str]:
     f"  {name} <名前>                          登録した動画を再生する",
     f"  {name} list                            登録一覧を表示する",
     f"  {name} show <名前>                     登録内容の詳細を見る",
-    f"  {name} edit <名前> [オプション]        登録内容を変更する",
+    f"  {name} edit <名前>                     設定を選んで変更する（画面が開きます）",
     f"  {name} remove <名前>                   登録を削除する",
     "",
     f"{terminal.BOLD}その他{terminal.RESET_ATTRIBUTES}",
@@ -227,7 +223,7 @@ def keyLines() -> list[str]:
   return [
     "再生中は次のキーが使えます．",
     "",
-    "  q          再生を終了する",
+    "  q / Esc    再生を終了する",
     "  Space      一時停止・再開",
     "  r          先頭から再生し直す",
     "  m          消音の切り替え（--audio 指定時）",
@@ -242,7 +238,7 @@ def keyLines() -> list[str]:
     "  Tab        次のタブへ",
     "  ↑ ↓        項目の移動・画面のスクロール（k j でも同じ）",
     "  ← →        タブを切り替える（h l でも同じ）",
-    "  q          メニューを閉じる",
+    "  q / Esc    メニューを閉じる",
     "",
     "既定の設定タブでは，← → の意味が変わります:",
     "  ← →        選択中の項目の値を増減する（数値は1段階ずつ）",
@@ -510,11 +506,11 @@ class Menu:
 
     if self.state.currentTab == TAB_SETTINGS:
       return truncateToWidth(
-        f"[Tab]タブ切替 [↑↓]移動 [←→]増減 [Enter]入力 [d]未設定 [q]終了{position}",
+        f"[Tab]切替 [↑↓]移動 [←→]増減 [Enter]入力 [d]未設定 [q/Esc]終了{position}",
         width,
       )
     return truncateToWidth(
-      f"[Tab/←→]タブ切替 [↑↓]スクロール [q]終了{position}", width
+      f"[Tab/←→]タブ切替 [↑↓]スクロール [q/Esc]終了{position}", width
     )
 
   def _moveDown(self) -> None:
@@ -591,7 +587,8 @@ class Menu:
     if self.state.editing:
       return self._handleEditKey(key)
 
-    if key in ("q", "Q"):
+    # Esc でも閉じられる（値の入力中は _handleEditKey が先に取り消しへ使う）
+    if key in ("q", "Q") or key == terminal.ESC:
       return False
     if key == "\t":
       self.state.moveTab(1)
