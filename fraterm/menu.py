@@ -171,9 +171,48 @@ VALUE_TEMPLATES: dict[str, str] = {
 }
 
 
+# 未設定のときに実際どう動くかの説明．既定値そのものを示す
+UNSET_DESCRIPTIONS: dict[str, str] = {
+  "mode": (
+    f"未設定なら {config.DEFAULT_MODE}: "
+    f"{VALUE_DESCRIPTIONS['mode'][config.DEFAULT_MODE]}"
+  ),
+  "charset": (
+    f"未設定ならモードに合わせます: ascii は {config.DEFAULT_CHARSET_NAME}（23階調），"
+    f"edge は薄い「{config.DEFAULT_EDGE_CHARSET}」"
+  ),
+  "color": (
+    f"未設定なら {config.DEFAULT_COLOR}: "
+    f"{VALUE_DESCRIPTIONS['color'][config.DEFAULT_COLOR]}"
+  ),
+  "width": "未設定ならターミナルの幅いっぱいに描きます",
+  "fps": "未設定なら動画のFPSに合わせて描きます（上限を設けません）",
+  "preRender": "未設定なら再生しながら変換します（待ち時間なしで始まります）",
+  "brightness": f"未設定なら {config.DEFAULT_BRIGHTNESS:g}（明るさを補正しません）",
+  "contrast": f"未設定なら {config.DEFAULT_CONTRAST:g}（明暗の差を変えません）",
+  "audio": "未設定なら音声を鳴らしません（映像だけ再生します）",
+  "volume": f"未設定なら {config.DEFAULT_VOLUME}%（そのままの音量で鳴らします）",
+  "audioOffset": (
+    f"未設定なら {config.DEFAULT_AUDIO_OFFSET:g}秒（映像と音声をずらしません）"
+  ),
+  "quality": (
+    f"未設定なら {config.DEFAULT_QUALITY}: "
+    f"{VALUE_DESCRIPTIONS['quality'][config.DEFAULT_QUALITY]}"
+  ),
+  "cache": "未設定ならダウンロードせず，直接ストリーミングします",
+  "cookiesFromBrowser": "未設定ならログイン情報を使いません（公開動画のみ再生できます）",
+  "cookiesFile": "未設定ならCookieファイルを使いません",
+  "playerClient": "未設定なら yt-dlp の判断に任せます（通常はこのままで問題ありません）",
+}
+
+
 def describeValue(item: SettingItem, value: Any) -> str:
   """設定した値でどう変わるかの説明を返す."""
   if value is None:
+    # 「標準の動作」が何かを具体的に示す
+    unsetDescription = UNSET_DESCRIPTIONS.get(item.key)
+    if unsetDescription is not None:
+      return unsetDescription
     return f"{item.description}（未設定のときは標準の動作です）"
 
   descriptions = VALUE_DESCRIPTIONS.get(item.key, {})

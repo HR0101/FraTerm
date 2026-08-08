@@ -432,7 +432,8 @@ def test_valueDescriptionChangesWithValue(isolatedHome):
   screen.state.itemIndex = 0  # 描画モード
 
   before = stripAnsi("\n".join(screen.bodyLines()))
-  assert "未設定のときは標準の動作です" in before
+  # 未設定のときは，実際の既定値が何かを示す
+  assert menu.UNSET_DESCRIPTIONS["mode"] in before
 
   screen.handleKey("\r")  # ascii
   afterAscii = stripAnsi("\n".join(screen.bodyLines()))
@@ -453,10 +454,36 @@ def test_describeValueForNumbers():
   assert description != widthItem.description
 
 
-def test_describeValueForUnsetUsesItemDescription():
-  """未設定のときは項目そのものの説明を出すことを確認する."""
-  modeItem = menu.SETTING_ITEMS[0]
-  assert modeItem.description in menu.describeValue(modeItem, None)
+def test_describeValueForUnsetNamesTheDefault():
+  """未設定のときに，実際の既定値が分かる説明になることを確認する."""
+  modeItem = next(item for item in menu.SETTING_ITEMS if item.key == "mode")
+  description = menu.describeValue(modeItem, None)
+
+  assert config.DEFAULT_MODE in description
+  assert "未設定" in description
+
+
+def test_everyItemExplainsItsDefault():
+  """すべての項目で，未設定のときの動作が説明されることを確認する."""
+  for item in menu.SETTING_ITEMS:
+    description = menu.describeValue(item, None)
+    assert item.key in menu.UNSET_DESCRIPTIONS, f"既定値の説明がありません: {item.key}"
+    assert "標準の動作です" not in description, f"具体的な説明がありません: {item.key}"
+
+
+@pytest.mark.parametrize(
+  "key, expectedFragment",
+  [
+    ("mode", config.DEFAULT_MODE),
+    ("color", config.DEFAULT_COLOR),
+    ("quality", config.DEFAULT_QUALITY),
+    ("volume", str(config.DEFAULT_VOLUME)),
+    ("charset", config.DEFAULT_CHARSET_NAME),
+  ],
+)
+def test_unsetDescriptionShowsActualDefault(key, expectedFragment):
+  """未設定の説明に，設定値そのものが含まれることを確認する."""
+  assert expectedFragment in menu.UNSET_DESCRIPTIONS[key]
 
 
 def test_everyChoiceHasDescription():
