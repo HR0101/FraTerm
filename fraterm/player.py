@@ -57,10 +57,6 @@ BACKSPACE_KEYS = ("\x7f", "\x08")
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 
-# 再生開始前に動画全体の黒帯を確認する代表サンプル数
-BORDER_SCAN_SAMPLES = 12
-
-
 class RenderedFrameStore:
   """事前生成したフレーム文字列を一時ファイルへ保存する."""
 
@@ -186,7 +182,6 @@ class Player:
     self._nextFrameIndex = 0
     self._lastRenderedMedia: float | None = None
     self._lastSize: tuple[int, int, int, int] | None = None
-    self._letterboxBounds: tuple[int, int, int, int] | None = None
     self._preRenderedFrames: RenderedFrameStore | None = None
     self._preRenderedLayout: tuple[int, int, int, int] | None = None
     self._audioPlayer: audioModule.AudioPlayer | None = None
@@ -216,7 +211,6 @@ class Player:
     capture = self._openCapture(cv2)
 
     self._capture = capture
-    self._letterboxBounds = None
     self._videoFps = self._readFps(capture, cv2)
     self._duration = self._readDuration(capture, cv2)
     if self._duration <= 0 and self.options.duration:
@@ -224,8 +218,6 @@ class Player:
       self._duration = float(self.options.duration)
 
     try:
-      # 動画全体で固定されている黒帯だけを再生前にクロップ対象にする
-      self._letterboxBounds = self._scanPersistentBorders(capture, cv2)
       if self.options.preRender:
         # 描画処理を再生前に終え，実際の再生中は文字列の出力だけにする
         self._preRenderVideo(capture)
@@ -364,67 +356,6 @@ class Player:
     if frameCount is None or frameCount != frameCount or frameCount <= 0:
       return 0.0
     return float(frameCount) / self._videoFps
-
-  @staticmethod
-  def _scanPersistentBorders(capture, cv2Module):
-    """動画全体から代表フレームを読み，常に黒い境界だけを返す.
-
-    シークできないストリームやフレーム数を取得できない動画では，安全側に倒して
-    クロップしない（None）．サンプル間で境界が変わる場合も，その辺は残す.
-    """
-    rawFrameCount = capture.get(cv2Module.CAP_PROP_FRAME_COUNT)
-    if rawFrameCount is None or rawFrameCount != rawFrameCount or rawFrameCount < 3:
-      return None
-
-    frameCount = int(rawFrameCount)
-    sampleCount = min(BORDER_SCAN_SAMPLES, frameCount)
-    sampleIndices = [
-      round(index * (frameCount - 1) / max(1, sampleCount - 1))
-      for index in range(sampleCount)
-    ]
-    sampledBounds: list[tuple[int, int, int, int]] = []
-    frameHeight = frameWidth = 0
-
-    try:
-      for frameIndex in sampleIndices:
-        if not capture.set(cv2Module.CAP_PROP_POS_FRAMES, frameIndex):
-          return None
-        isRead, frame = capture.read()
-        if not isRead or frame is None:
-          return None
-        frameHeight, frameWidth = frame.shape[:2]
-        sampledBounds.append(renderer.detectBlackBorders(frame))
-    finally:
-      # 先読みスレッドが必ず先頭から始められるように戻す
-      capture.set(cv2Module.CAP_PROP_POS_FRAMES, 0)
-
-    if not sampledBounds or frameHeight <= 0 or frameWidth <= 0:
-      return None
-
-    def persistentStart(values: list[int], size: int) -> int:
-      minimumSize = max(2, round(size * renderer.LETTERBOX_MIN_FRACTION))
-      tolerance = max(2, round(size * 0.01))
-      if min(values) < minimumSize or max(values) - min(values) > tolerance:
-        return 0
-      return min(values)
-
-    def persistentEnd(values: list[int], size: int) -> int:
-      minimumSize = max(2, round(size * renderer.LETTERBOX_MIN_FRACTION))
-      tolerance = max(2, round(size * 0.01))
-      if size - max(values) < minimumSize or max(values) - min(values) > tolerance:
-        return size
-      return max(values)
-
-    topValues = [bounds[0] for bounds in sampledBounds]
-    bottomValues = [bounds[1] for bounds in sampledBounds]
-    leftValues = [bounds[2] for bounds in sampledBounds]
-    rightValues = [bounds[3] for bounds in sampledBounds]
-    return (
-      persistentStart(topValues, frameHeight),
-      persistentEnd(bottomValues, frameHeight),
-      persistentStart(leftValues, frameWidth),
-      persistentEnd(rightValues, frameWidth),
-    )
 
   def _preRenderVideo(self, capture) -> None:
     """動画を先頭から最後まで変換し，描画用の一時ファイルへ保存する."""
@@ -950,14 +881,7 @@ class Player:
     terminalWidth: int | None = None,
     terminalHeight: int | None = None,
   ) -> tuple[str, int, int, int, int]:
-    """フレームをクロップ・サイズ計算・文字列化する."""
-    if self._letterboxBounds is None:
-      self._letterboxBounds = (0, frame.shape[0], 0, frame.shape[1])
-    top, bottom, left, right = self._letterboxBounds
-    if top > 0 or bottom < frame.shape[0] or left > 0 or right < frame.shape[1]:
-      # 映画由来の黒帯を除いてからサイズ計算し，映像部分を端末いっぱいに表示する
-      frame = frame[top:bottom, left:right]
-
+    """フレームのサイズ計算・文字列化を行う（元の画角を維持する）."""
     frameHeight, frameWidth = frame.shape[:2]
     if terminalWidth is None or terminalHeight is None:
       terminalWidth, terminalHeight = self._terminalSize()
