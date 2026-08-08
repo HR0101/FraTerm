@@ -34,6 +34,18 @@ def test_computeSizeFitsInTerminalHeight():
   assert columns <= 200
 
 
+def test_computeSizeUsesAllRowsWithoutStatusLine():
+  """ステータス行を出さない場合は，その1行も描画に使うことを確認する."""
+  terminalHeight = 20
+  _, rowsWithStatus = renderer.computeSize(100, 400, 40, terminalHeight)
+  _, rowsWithoutStatus = renderer.computeSize(
+    100, 400, 40, terminalHeight, reservedRows=0
+  )
+
+  assert rowsWithStatus == terminalHeight - config.STATUS_ROW_COUNT
+  assert rowsWithoutStatus == terminalHeight
+
+
 def test_computeSizeRespectsMaxWidth():
   """--width 指定が上限として働くことを確認する."""
   columns, _ = renderer.computeSize(1920, 1080, 200, 60, maxWidth=40)
@@ -271,6 +283,75 @@ def test_edgeModeUsesItsOwnDefaultCharset():
   assert config.charsetFor(config.MODE_ASCII, None) == config.DEFAULT_CHARSET
   # 明示的に指定した場合は，モードによらずその指定を使う
   assert config.charsetFor(config.MODE_EDGE, "simple") == config.CHARSET_PRESETS["simple"]
+
+
+def test_xterm256MapsGrayToGrayscaleRamp():
+  """無彩色がグレースケール階調へ割り当てられることを確認する."""
+  grayValues = np.array([[[128, 128, 128]]], dtype=np.uint8)
+  index = int(renderer.toXterm256(grayValues)[0][0])
+  assert renderer.GRAYSCALE_OFFSET <= index <= renderer.GRAYSCALE_OFFSET + renderer.GRAYSCALE_STEPS
+
+
+def test_xterm256MapsColorToCube():
+  """有彩色が色立方体の範囲へ割り当てられることを確認する."""
+  redValues = np.array([[[255, 0, 0]]], dtype=np.uint8)
+  index = int(renderer.toXterm256(redValues)[0][0])
+  # 純赤は 16 + 36*5 = 196 になる
+  assert index == 196
+
+
+def test_renderAsciiWithoutColorHasNoEscape():
+  """着色なしの場合はANSIコードを含まないことを確認する."""
+  output = renderer.renderAscii(makeFrame(32, 32, 128), 8, 2, colorMode=config.COLOR_OFF)
+  assert renderer.ESC not in output
+
+
+def test_renderAsciiWith256Color():
+  """256色指定で 38;5 形式のANSIコードが使われることを確認する."""
+  output = renderer.renderAscii(
+    makeStripedFrame(64, 64), 16, 4, colorMode=config.COLOR_256
+  )
+  assert "38;5;" in output
+  assert "38;2;" not in output
+  assert output.split("\n")[0].endswith(renderer.RESET)
+
+
+def test_renderAsciiWithTrueColor():
+  """true指定で24bitカラーのANSIコードが使われることを確認する."""
+  output = renderer.renderAscii(
+    makeStripedFrame(64, 64), 16, 4, colorMode=config.COLOR_TRUE
+  )
+  assert "38;2;" in output
+
+
+def test_colorCodesAreOmittedWhenRepeated():
+  """同じ色が続く場合にANSIコードが省略されることを確認する."""
+  output = renderer.renderAscii(makeFrame(64, 64, 128), 20, 2, colorMode=config.COLOR_256)
+  assert output.split("\n")[0].count("38;5;") == 1
+
+
+def test_renderAsciiKeepsShapeWhenColored():
+  """着色しても文字数が変わらないことを確認する."""
+  plain = renderer.renderAscii(makeStripedFrame(64, 64), 16, 4)
+  colored = renderer.renderAscii(
+    makeStripedFrame(64, 64), 16, 4, colorMode=config.COLOR_TRUE
+  )
+  stripped = re.sub(r"\x1b\[[0-9;]*m", "", colored)
+  assert stripped == plain
+
+
+def test_renderEdgeSupportsColor():
+  """輪郭モードでも文字に色を付けられることを確認する."""
+  output = renderer.renderEdge(
+    makeStripedFrame(96, 96), 24, 8, colorMode=config.COLOR_256
+  )
+  assert "38;5;" in output
+  assert any(character in output for character in renderer.EDGE_CHARACTERS)
+
+
+def test_detailedCharsetIsDenser():
+  """detailed プリセットが標準より多くの階調を持つことを確認する."""
+  assert len(config.CHARSET_PRESETS["detailed"]) > len(config.CHARSET_PRESETS["standard"])
 
 
 def test_renderFrameDispatchesByMode():

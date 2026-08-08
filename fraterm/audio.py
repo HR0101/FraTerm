@@ -6,6 +6,7 @@ import atexit
 import shutil
 import subprocess
 
+from . import config
 from .errors import AudioError
 
 FFPLAY_COMMAND = "ffplay"
@@ -16,6 +17,13 @@ MAX_TEMPO = 2.0
 
 # プロセス終了を待つ最大時間（秒）
 TERMINATE_TIMEOUT = 1.0
+
+# 音声の加工に使う ffmpeg のフィルタ
+# acrusher でビット深度を落とし，aresample で標本化周波数も下げてレトロ感を出す
+EFFECT_FILTERS = {
+  config.AUDIO_EFFECT_8BIT: "acrusher=bits=8:mode=log:aa=0,aresample=11025",
+  config.AUDIO_EFFECT_4BIT: "acrusher=bits=4:mode=log:aa=0,aresample=8000",
+}
 
 
 def isAvailable() -> bool:
@@ -35,6 +43,23 @@ def ensureAvailable() -> None:
       "音声なしで再生する場合は --no-audio を指定してください．"
     ),
   )
+
+
+def buildFilterChain(speed: float, effect: str = config.DEFAULT_AUDIO_EFFECT) -> str:
+  """再生速度と音声加工から，ffplay へ渡すフィルタ指定を組み立てる.
+
+  指定が無い場合は空文字を返し，呼び出し側で -af を省略する.
+  """
+  filters: list[str] = []
+
+  effectFilter = EFFECT_FILTERS.get(effect)
+  if effectFilter:
+    filters.append(effectFilter)
+
+  if abs(speed - 1.0) > 1e-6:
+    filters.append(buildTempoFilter(speed))
+
+  return ",".join(filters)
 
 
 def buildTempoFilter(speed: float) -> str:
@@ -70,10 +95,18 @@ class AudioPlayer:
   # 再生制御
   # ---------------------------------------------------------------------
 
-  def start(self, position: float = 0.0, speed: float = 1.0) -> None:
+  def start(
+    self,
+    position: float = 0.0,
+    speed: float = 1.0,
+    volume: int = config.DEFAULT_VOLUME,
+    effect: str = config.DEFAULT_AUDIO_EFFECT,
+  ) -> None:
     """指定位置から音声再生を開始する．すでに再生中なら一度停止する."""
     ensureAvailable()
     self.stop()
+
+    clampedVolume = max(config.MIN_VOLUME, min(config.MAX_VOLUME, int(volume)))
 
     command = [
       FFPLAY_COMMAND,
@@ -82,12 +115,15 @@ class AudioPlayer:
       "-vn",  # 映像ストリームを読み込まない
       "-loglevel",
       "quiet",
+      "-volume",
+      str(clampedVolume),
       "-ss",
       f"{max(0.0, position):.3f}",
     ]
 
-    if abs(speed - 1.0) > 1e-6:
-      command.extend(["-af", buildTempoFilter(speed)])
+    filterChain = buildFilterChain(speed, effect)
+    if filterChain:
+      command.extend(["-af", filterChain])
 
     command.append(self.videoPath)
 

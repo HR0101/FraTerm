@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 import pytest
@@ -209,6 +210,143 @@ def test_runPlaysWithoutRegistration(dummyVideo, recordedPlayers):
   assert recordedPlayers[0].options.mode == "mono"
   assert recordedPlayers[0].options.title == dummyVideo.name
   assert Registry().names() == []
+
+
+def collectSubcommandNames() -> set[str]:
+  """パーサに登録されている全サブコマンド名（別名を含む）を集める."""
+  parser = cli.buildParser()
+  names: set[str] = set()
+  for action in parser._actions:
+    if isinstance(action, argparse._SubParsersAction):
+      names.update(action.choices.keys())
+  return names
+
+
+def test_allSubcommandsAreReservedNames():
+  """サブコマンドを増やしても予約語の更新漏れが起きないことを確認する."""
+  from fraterm.registry import RESERVED_NAMES
+
+  missing = collectSubcommandNames() - set(RESERVED_NAMES)
+  assert missing == set(), f"予約語に入っていないサブコマンド: {sorted(missing)}"
+
+
+def test_allSubcommandsAreRecognizedAsCommands():
+  """サブコマンドが登録名として誤解釈されないことを確認する."""
+  for name in collectSubcommandNames():
+    assert cli.expandImplicitPlay([name]) == [name]
+
+
+@pytest.mark.parametrize("reservedName", ["cache", "CACHE", "ls", "info", "delete"])
+def test_reservedNamesCannotBeRegistered(dummyVideo, capsys, reservedName):
+  """予約語は大文字小文字を問わず登録できないことを確認する."""
+  assert cli.main(["add", reservedName, str(dummyVideo)]) == cli.EXIT_ERROR
+  assert "コマンド名と重複" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("charset", ["　あい", "あa", "・－"])
+def test_wideCharsetIsRejected(dummyVideo, charset):
+  """表示幅が1でない文字セットを拒否することを確認する."""
+  with pytest.raises(SystemExit) as exitInfo:
+    cli.main(["run", str(dummyVideo), "--charset", charset])
+  assert exitInfo.value.code != 0
+
+
+def test_blockCharsetIsStillAccepted(dummyVideo):
+  """既存のブロック文字プリセットは引き続き使えることを確認する."""
+  cli.main(["add", "sample", str(dummyVideo), "--charset", "blocks"])
+  assert Registry().get("sample").charset == "blocks"
+
+
+def test_controlCharactersAreStrippedFromListing(dummyVideo, tmp_path, capsys):
+  """制御文字を含むパスがそのまま端末へ出力されないことを確認する."""
+  trickyFile = tmp_path / "movie\x1b[31m.mp4"
+  trickyFile.write_bytes(b"\x00")
+
+  cli.main(["add", "tricky", str(trickyFile)])
+  capsys.readouterr()
+
+  cli.main(["list"])
+  listing = capsys.readouterr().out
+  assert "\x1b" not in listing
+
+  cli.main(["show", "tricky"])
+  assert "\x1b" not in capsys.readouterr().out
+
+
+def test_saveHandlerRegistersLocalFile(dummyVideo, recordedPlayers):
+  """再生中の保存で，ローカルファイルがそのまま登録されることを確認する."""
+  cli.main(["run", str(dummyVideo), "--mode", "edge", "--width", "70"])
+
+  saveHandler = recordedPlayers[0].options.onSave
+  message = saveHandler("myclip")
+
+  entry = Registry().get("myclip")
+  assert entry.path == str(dummyVideo)
+  assert entry.mode == "edge"
+  assert entry.width == 70
+  assert entry.cache is False
+  assert "myclip" in message
+
+
+def test_saveHandlerRejectsDuplicateName(dummyVideo, recordedPlayers):
+  """すでに使われている名前では保存しないことを確認する."""
+  cli.main(["add", "myclip", str(dummyVideo)])
+  cli.main(["run", str(dummyVideo)])
+
+  message = recordedPlayers[0].options.onSave("myclip")
+  assert "すでに登録されています" in message
+
+
+def test_saveHandlerRejectsInvalidName(dummyVideo, recordedPlayers):
+  """使用できない名前を弾くことを確認する."""
+  cli.main(["run", str(dummyVideo)])
+
+  message = recordedPlayers[0].options.onSave("list")
+  assert "コマンド名と重複" in message
+  assert Registry().names() == []
+
+
+def test_saveHandlerDownloadsUrlForOfflinePlayback(
+  tmp_path, monkeypatch, recordedSources, recordedPlayers
+):
+  """URLの保存でダウンロードし，オフライン再生できる形で登録することを確認する."""
+  downloadedFile = tmp_path / "saved.mp4"
+  downloadedFile.write_bytes(b"\x00")
+
+  monkeypatch.setattr(cli.source, "fetchMetadata", lambda url, quality, cookies=None: {"id": "abc", "ext": "mp4"})
+  monkeypatch.setattr(
+    cli.source,
+    "downloadToCache",
+    lambda url, quality, targetPath, notify=None, cookies=None: downloadedFile,
+  )
+
+  cli.main(["run", SAMPLE_URL, "--quality", "360"])
+  message = recordedPlayers[0].options.onSave("zoo")
+
+  entry = Registry().get("zoo")
+  assert entry.path == SAMPLE_URL  # 元のURLを保持している
+  assert entry.cache is True
+  assert entry.cachedPath == str(downloadedFile)
+  assert entry.quality == "360"
+  assert "オフライン" in message
+
+
+def test_colorOptionIsPersistedAndUsed(dummyVideo, recordedPlayers):
+  """文字の着色指定が保存され，再生時に使われることを確認する."""
+  cli.main(["add", "sample", str(dummyVideo), "--mode", "ascii", "--color", "256"])
+  assert Registry().get("sample").color == "256"
+
+  assert cli.main(["sample"]) == cli.EXIT_OK
+  assert recordedPlayers[0].options.color == "256"
+
+
+def test_colorOptionCanBeOverridden(dummyVideo, recordedPlayers):
+  """再生時の着色指定が登録内容より優先されることを確認する."""
+  cli.main(["add", "sample", str(dummyVideo), "--color", "256"])
+  cli.main(["play", "sample", "--color", "true"])
+
+  assert recordedPlayers[0].options.color == "true"
+  assert Registry().get("sample").color == "256"
 
 
 def test_charsetPresetIsAccepted(dummyVideo):
@@ -428,6 +566,51 @@ def test_downloadedPathIsRemembered(tmp_path, monkeypatch, recordedPlayers):
   assert cli.main(["opening"]) == cli.EXIT_OK
 
   assert Registry().get("opening").cachedPath == str(downloadedFile)
+
+
+def test_cacheIsNotReusedAfterQualityChange(
+  tmp_path, recordedSources, recordedPlayers, capsys
+):
+  """画質を変えたら，前の画質のキャッシュを使い回さないことを確認する."""
+  cachedFile = tmp_path / "cached480.mp4"
+  cachedFile.write_bytes(b"\x00")
+
+  cli.main(["add", "opening", SAMPLE_URL, "--cache", "--quality", "480"])
+  Registry().update(
+    "opening", {"cachedPath": str(cachedFile), "cachedQuality": "480"}
+  )
+  capsys.readouterr()
+
+  # 同じ画質ならキャッシュをそのまま使う
+  assert cli.main(["opening"]) == cli.EXIT_OK
+  assert recordedSources == []
+  assert recordedPlayers[0].videoPath == str(cachedFile)
+
+  # 画質を変えたら取得し直す
+  assert cli.main(["play", "opening", "--quality", "720"]) == cli.EXIT_OK
+  assert len(recordedSources) == 1
+  assert recordedSources[0]["quality"] == "720"
+
+
+def test_cachedQualityIsRecordedAfterDownload(tmp_path, monkeypatch, recordedPlayers):
+  """ダウンロード時に，使用した画質も登録内容へ残ることを確認する."""
+  downloadedFile = tmp_path / "downloaded.mp4"
+  downloadedFile.write_bytes(b"\x00")
+
+  monkeypatch.setattr(
+    cli.source,
+    "openSource",
+    lambda pathOrUrl, quality=None, useCache=False, notify=None, cookies=None: source.PlayableSource(
+      path=str(downloadedFile), title="テスト動画", isRemote=False
+    ),
+  )
+
+  cli.main(["add", "opening", SAMPLE_URL, "--cache", "--quality", "720"])
+  cli.main(["opening"])
+
+  entry = Registry().get("opening")
+  assert entry.cachedPath == str(downloadedFile)
+  assert entry.cachedQuality == "720"
 
 
 def test_missingCachedFileFallsBackToResolve(recordedSources, recordedPlayers):

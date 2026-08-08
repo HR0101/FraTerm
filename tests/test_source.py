@@ -178,7 +178,7 @@ def test_resolveUrlWithCacheDownloads(monkeypatch, isolatedHome):
   """--cache 指定時にダウンロードした結果を再生対象にすることを確認する."""
   monkeypatch.setattr(source, "fetchMetadata", lambda url, quality, cookies=None: SAMPLE_METADATA)
 
-  downloadedPath = isolatedHome / config.CACHE_DIR_NAME / "dQw4w9WgXcQ.mp4"
+  expectedPath = source.cachePathFor(SAMPLE_METADATA, SAMPLE_URL, "480")
 
   def fakeDownload(url, quality, targetPath, notify=None, cookies=None):
     targetPath.parent.mkdir(parents=True, exist_ok=True)
@@ -188,7 +188,7 @@ def test_resolveUrlWithCacheDownloads(monkeypatch, isolatedHome):
   monkeypatch.setattr(source, "downloadToCache", fakeDownload)
 
   playable = source.resolveUrl(SAMPLE_URL, "480", True)
-  assert playable.path == str(downloadedPath)
+  assert playable.path == str(expectedPath)
   assert playable.isRemote is False
 
 
@@ -218,6 +218,50 @@ def test_cookieOptionsRejectsMissingFile(tmp_path):
 def test_cookieOptionsWithoutSettings():
   """Cookieを指定しない場合は引数が増えないことを確認する."""
   assert source.AccessOptions().toArguments() == []
+
+
+def test_jsRuntimeArgumentsEnablesInstalledRuntimes(monkeypatch):
+  """導入済みのJavaScriptランタイムだけを有効化することを確認する."""
+  monkeypatch.setattr(
+    source.shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None
+  )
+  assert source.jsRuntimeArguments() == ["--js-runtimes", "node"]
+
+
+def test_jsRuntimeArgumentsPrefersAllAvailable(monkeypatch):
+  """複数導入されていれば，優先順に沿ってすべて有効化することを確認する."""
+  monkeypatch.setattr(
+    source.shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("deno", "node") else None
+  )
+  assert source.jsRuntimeArguments() == [
+    "--js-runtimes",
+    "deno",
+    "--js-runtimes",
+    "node",
+  ]
+
+
+def test_jsRuntimeArgumentsWithoutRuntimes(monkeypatch):
+  """ランタイムが無ければ引数を増やさないことを確認する."""
+  monkeypatch.setattr(source.shutil, "which", lambda name: None)
+  assert source.jsRuntimeArguments() == []
+
+
+def test_fetchMetadataEnablesJsRuntime(monkeypatch):
+  """取得時にJavaScriptランタイムの指定が渡ることを確認する."""
+  capturedArguments: list[str] = []
+
+  def fakeRun(arguments, timeout):
+    capturedArguments.extend(arguments)
+    return makeCompletedProcess(stdout=json.dumps(SAMPLE_METADATA))
+
+  monkeypatch.setattr(source, "runYtdlp", fakeRun)
+  monkeypatch.setattr(
+    source.shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None
+  )
+  source.fetchMetadata(SAMPLE_URL, "480")
+
+  assert "--js-runtimes" in capturedArguments
 
 
 def test_accessOptionsBuildsPlayerClientArgument():
@@ -270,6 +314,8 @@ def test_fetchMetadataPassesCookieArguments(monkeypatch):
       "ERROR: This video is age-restricted and only available on YouTube.",
       "--player-client",
     ),
+    ("WARNING: Signature solving failed: Some formats may be missing.", "deno"),
+    ("WARNING: Only images are available for download.", "yt-dlp-ejs"),
     ("ERROR: something completely different", "yt-dlp -U"),
   ],
 )
@@ -296,16 +342,95 @@ def test_ageRestrictedErrorSuggestsCookies(monkeypatch):
 
 def test_cachePathForSanitizesId(isolatedHome):
   """キャッシュのファイル名が安全な文字だけになることを確認する."""
-  cachePath = source.cachePathFor({"id": "../evil id", "ext": "mp4"})
-  assert cachePath.name == "evilid.mp4"
+  cachePath = source.cachePathFor({"id": "../evil id", "ext": "mp4"}, SAMPLE_URL, "480")
   assert cachePath.parent == isolatedHome / config.CACHE_DIR_NAME
+  assert "/" not in cachePath.name
+  assert ".." not in cachePath.name
+  assert cachePath.name.endswith(".mp4")
+
+
+@pytest.mark.parametrize(
+  "extension",
+  ["../../../outside/file", "/etc/passwd", "mp4/../..", "", "mp4;rm -rf"],
+)
+def test_cachePathStaysInsideCacheDirectory(isolatedHome, extension):
+  """拡張子に細工があってもキャッシュ外へ書き出さないことを確認する."""
+  cachePath = source.cachePathFor({"id": "abc", "ext": extension}, SAMPLE_URL, "480")
+  cacheDirectory = (isolatedHome / config.CACHE_DIR_NAME).resolve()
+
+  assert cachePath.resolve().parent == cacheDirectory
+  assert cachePath.parent == isolatedHome / config.CACHE_DIR_NAME
+
+
+def test_cacheKeyDiffersByQuality(isolatedHome):
+  """画質が違えば別のキャッシュになることを確認する."""
+  lowQuality = source.cachePathFor(SAMPLE_METADATA, SAMPLE_URL, "360")
+  highQuality = source.cachePathFor(SAMPLE_METADATA, SAMPLE_URL, "720")
+  assert lowQuality != highQuality
+
+
+def test_cacheKeyDiffersByUrl(isolatedHome):
+  """動画IDが同じでもURLが違えば別のキャッシュになることを確認する."""
+  first = source.cachePathFor(SAMPLE_METADATA, "https://example.com/a", "480")
+  second = source.cachePathFor(SAMPLE_METADATA, "https://example.com/b", "480")
+  assert first != second
+
+
+def test_cacheKeyIsStableForSameInput(isolatedHome):
+  """同じ入力なら同じキャッシュ名になることを確認する."""
+  first = source.cachePathFor(SAMPLE_METADATA, SAMPLE_URL, "480")
+  second = source.cachePathFor(SAMPLE_METADATA, SAMPLE_URL, "480")
+  assert first == second
+
+
+def test_partialFileIsNotReusedAsCache(isolatedHome, monkeypatch):
+  """途中で終わった小さなファイルを再利用しないことを確認する."""
+  cachePath = isolatedHome / config.CACHE_DIR_NAME / "broken.mp4"
+  cachePath.parent.mkdir(parents=True, exist_ok=True)
+  cachePath.write_bytes(b"\x00" * 10)  # 明らかに不完全なサイズ
+
+  calls: list[list[str]] = []
+
+  def fakeRun(arguments, timeout):
+    calls.append(arguments)
+    # ダウンロード先（.part）へ十分な大きさのファイルを作る
+    partialPath = cachePath.with_name(cachePath.name + source.PARTIAL_SUFFIX)
+    partialPath.write_bytes(b"\x00" * (source.MIN_CACHE_FILE_SIZE + 1))
+    return makeCompletedProcess()
+
+  monkeypatch.setattr(source, "runYtdlp", fakeRun)
+  result = source.downloadToCache(SAMPLE_URL, "480", cachePath)
+
+  assert calls, "壊れたキャッシュがあるのに再取得していません"
+  assert result.stat().st_size > source.MIN_CACHE_FILE_SIZE
+  assert not result.with_name(result.name + source.PARTIAL_SUFFIX).exists()
+
+
+def test_incompleteDownloadRaisesAndCleansUp(isolatedHome, monkeypatch):
+  """ダウンロードが不完全なら，残骸を消してエラーにすることを確認する."""
+  cachePath = isolatedHome / config.CACHE_DIR_NAME / "tiny.mp4"
+  cachePath.parent.mkdir(parents=True, exist_ok=True)
+
+  def fakeRun(arguments, timeout):
+    partialPath = cachePath.with_name(cachePath.name + source.PARTIAL_SUFFIX)
+    partialPath.write_bytes(b"\x00")  # 小さすぎるファイル
+    return makeCompletedProcess()
+
+  monkeypatch.setattr(source, "runYtdlp", fakeRun)
+
+  with pytest.raises(SourceError) as errorInfo:
+    source.downloadToCache(SAMPLE_URL, "480", cachePath)
+
+  assert "不完全" in errorInfo.value.message
+  assert not cachePath.exists()
+  assert not cachePath.with_name(cachePath.name + source.PARTIAL_SUFFIX).exists()
 
 
 def test_downloadToCacheReusesExistingFile(monkeypatch, isolatedHome, capsys):
   """すでにダウンロード済みならyt-dlpを実行しないことを確認する."""
   cachePath = isolatedHome / config.CACHE_DIR_NAME / "video.mp4"
   cachePath.parent.mkdir(parents=True, exist_ok=True)
-  cachePath.write_bytes(b"\x00\x01")
+  cachePath.write_bytes(b"\x00" * (source.MIN_CACHE_FILE_SIZE + 1))
 
   def failIfCalled(*args, **kwargs):
     raise AssertionError("yt-dlp が実行されました")

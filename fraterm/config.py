@@ -19,10 +19,39 @@ SHORT_COMMAND_NAME = "ft"
 # 実行時のコマンド名として認める値
 COMMAND_ALIASES = (APP_NAME, SHORT_COMMAND_NAME)
 
+# ---------------------------------------------------------------------------
+# サブコマンド
+# ---------------------------------------------------------------------------
+
+# サブコマンド名と別名．CLIの認識と登録名の予約語は，この定義だけを見る
+SUBCOMMANDS = {
+  "add": (),
+  "list": ("ls",),
+  "show": ("info",),
+  "edit": (),
+  "remove": ("rm", "delete"),
+  "play": (),
+  "run": (),
+  "cache": (),
+  "defaults": ("config",),
+  "menu": ("help",),
+}
+
+# サブコマンドとして解釈する語（別名を含む）
+COMMAND_NAMES = frozenset(
+  name for command, aliases in SUBCOMMANDS.items() for name in (command, *aliases)
+)
+
+# 登録名として使えない語．サブコマンドに加え，argparse が持つ語も含める
+RESERVED_NAMES = COMMAND_NAMES | frozenset({"help", "version"})
+
 # 設定ディレクトリを明示的に差し替えるための環境変数（テストや持ち運び用）
 HOME_ENV_VAR = "FRATERM_HOME"
 
 REGISTRY_FILE_NAME = "videos.json"
+
+# オプションの既定値を保存するファイル
+SETTINGS_FILE_NAME = "settings.json"
 
 # ダウンロードした動画を保存するディレクトリ名
 CACHE_DIR_NAME = "cache"
@@ -77,6 +106,19 @@ DEFAULT_MODE = MODE_ASCII
 # 上下2画素を1文字で表現するモード（ハーフブロック文字を使用する）
 HALF_BLOCK_MODES = (MODE_COLOR, MODE_MONO)
 
+# 文字で描くモード．これらは --color で文字自体へ色を付けられる
+CHARACTER_MODES = (MODE_ASCII, MODE_EDGE)
+
+# ---------------------------------------------------------------------------
+# 文字の着色（--color）
+# ---------------------------------------------------------------------------
+
+COLOR_OFF = "off"
+COLOR_256 = "256"
+COLOR_TRUE = "true"
+COLOR_CHOICES = (COLOR_OFF, COLOR_256, COLOR_TRUE)
+DEFAULT_COLOR = COLOR_OFF
+
 # ---------------------------------------------------------------------------
 # 文字セット
 # ---------------------------------------------------------------------------
@@ -84,6 +126,9 @@ HALF_BLOCK_MODES = (MODE_COLOR, MODE_MONO)
 # 暗い画素から明るい画素の順に並べる
 CHARSET_PRESETS = {
   "standard": " .,:;irsXA253hMHGS#9B&@",
+  "detailed": (
+    " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
+  ),
   "simple": " .:-=+*#%@",
   "blocks": " ░▒▓█",
   "minimal": " .*#",
@@ -140,6 +185,28 @@ DEFAULT_CONTRAST = 1.0
 MIN_SPEED = 0.25
 MAX_SPEED = 4.0
 SPEED_STEP = 0.25
+
+# 音量（ffplay へ渡す0〜100の値）
+DEFAULT_VOLUME = 100
+MIN_VOLUME = 0
+MAX_VOLUME = 100
+VOLUME_STEP = 10
+
+# ffplay が実際に音を出し始めるまでの遅延（実測で0.25〜0.55秒）．
+# この分だけ先の位置から再生させることで，映像との頭出しを合わせる
+AUDIO_START_LATENCY = 0.35
+
+# 音声の加工（レトロゲーム風のビットクラッシュ）
+AUDIO_EFFECT_NONE = "none"
+AUDIO_EFFECT_8BIT = "8bit"
+AUDIO_EFFECT_4BIT = "4bit"
+AUDIO_EFFECT_CHOICES = (AUDIO_EFFECT_NONE, AUDIO_EFFECT_8BIT, AUDIO_EFFECT_4BIT)
+DEFAULT_AUDIO_EFFECT = AUDIO_EFFECT_NONE
+
+# 音声と映像のずれを補正する秒数．正の値で音声が先行する
+DEFAULT_AUDIO_OFFSET = 0.0
+MIN_AUDIO_OFFSET = -5.0
+MAX_AUDIO_OFFSET = 5.0
 
 # 一時停止中にキー入力を待つ間隔（秒）
 PAUSED_POLL_INTERVAL = 0.05
