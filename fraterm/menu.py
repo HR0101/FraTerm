@@ -44,6 +44,9 @@ AVAILABLE_LANGUAGES = ("日本語",)
 ENTER_KEYS = ("\r", "\n")
 BACKSPACE_KEYS = ("\x7f", "\x08")
 
+# 入力中でも「確定してから動く」キー
+ARROW_KEYS = (KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT)
+
 
 @dataclass
 class SettingItem:
@@ -352,16 +355,31 @@ def formatValue(value: Any) -> str:
 
 
 def parseTextValue(item: SettingItem, rawValue: str) -> Any:
-  """入力された文字列を，項目に応じた値へ変換する."""
+  """入力された文字列を，項目に応じた値へ変換する.
+
+  数値は設定できる範囲へ収める．範囲外の値をそのまま保存すると，
+  コマンドから指定した場合には拒否される値が既定値に残ってしまう.
+  """
   text = rawValue.strip()
   if not text:
     return None
 
   if item.key in ("width", "volume"):
-    return int(text)
+    return clampNumber(item, int(text))
   if item.key in ("fps", "brightness", "contrast", "audioOffset"):
-    return float(text)
+    return clampNumber(item, float(text))
   return text
+
+
+def clampNumber(item: SettingItem, value: float) -> Any:
+  """数値を項目の範囲へ収める."""
+  if not item.isNumeric:
+    return value
+
+  clamped = max(item.minimum, min(item.maximum, value))
+  if item.decimals > 0:
+    return round(clamped, item.decimals)
+  return int(round(clamped))
 
 
 def nextChoice(item: SettingItem, currentValue: Any) -> Any:
@@ -473,7 +491,7 @@ class Menu:
 
     lines = [
       "毎回のオプションを省略するための既定値です．run と add に適用されます．",
-      "← → で1段階ずつ変更，Enter で入力（選択肢は次の値へ），d で未設定へ戻します．",
+      "← → で変更（その場で保存されます），Enter で直接入力，d で未設定へ戻します．",
       "",
     ]
     for index, item in enumerate(SETTING_ITEMS):
@@ -534,7 +552,9 @@ class Menu:
       item = self.state.currentItem
       label = item.label if item else ""
       return truncateToWidth(
-        f"{label}: {self.state.editBuffer}_  [Enter]決定 [Esc]取消", width
+        f"{label}: {self.state.editBuffer}_  "
+        f"[Enter]決定 [↑↓]確定して移動 [Esc]取消",
+        width,
       )
 
     if self.state.message:
@@ -662,6 +682,11 @@ class Menu:
 
   def _handleEditKey(self, key: str) -> bool:
     """値の入力中のキーを処理する."""
+    if key in ARROW_KEYS:
+      # 入力をそのまま確定し，矢印キー本来の移動・増減へ進む
+      self._commitEdit()
+      return self.handleKey(key)
+
     if key == terminal.ESC:
       self.state.editing = False
       self.state.editBuffer = ""

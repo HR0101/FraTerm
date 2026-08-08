@@ -83,7 +83,7 @@ class EntryEditor:
     lines = [
       f"{terminal.DIM}{'URL' if self.entry.isRemote else 'ファイル'}: {location}"
       f"{terminal.RESET_ATTRIBUTES}",
-      "← → で1段階ずつ変更，Enter で入力，d で既定へ戻します．",
+      "← → で変更（その場で保存されます），Enter で直接入力，d で既定へ戻します．",
       "",
     ]
     for index, item in enumerate(self.items):
@@ -107,7 +107,9 @@ class EntryEditor:
       item = self.currentItem
       label = item.label if item else ""
       return truncateToWidth(
-        f"{label}: {self.state.editBuffer}_  [Enter]決定 [Esc]取消", width
+        f"{label}: {self.state.editBuffer}_  "
+        f"[Enter]決定 [↑↓]確定して移動 [Esc]取消",
+        width,
       )
 
     if self.state.message:
@@ -196,6 +198,11 @@ class EntryEditor:
 
   def _handleEditKey(self, key: str) -> bool:
     """値の入力中のキーを処理する."""
+    if key in menu.ARROW_KEYS:
+      # 入力をそのまま確定し，矢印キー本来の移動・変更へ進む
+      self._commitEdit()
+      return self.handleKey(key)
+
     if key == terminal.ESC:
       self.state.editing = False
       self.state.editBuffer = ""
