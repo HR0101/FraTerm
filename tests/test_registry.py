@@ -37,6 +37,14 @@ def test_addAndGetEntry(dummyVideo):
   assert entry.width == 100
 
 
+def test_preRenderSettingRoundTrips(dummyVideo):
+  """登録情報へ事前生成の設定を保存・復元できることを確認する."""
+  registry = Registry()
+  registry.add(makeEntry("sample", dummyVideo, preRender=True))
+
+  assert Registry().get("sample").preRender is True
+
+
 def test_registryFileIsCreatedAtConfiguredPath(dummyVideo, isolatedHome):
   """設定ファイルが所定の場所へ作られることを確認する."""
   Registry().add(makeEntry("sample", dummyVideo))

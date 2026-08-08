@@ -83,6 +83,10 @@ SETTING_ITEMS: tuple[SettingItem, ...] = (
     step=5, minimum=1, maximum=120, base=30,
   ),
   SettingItem(
+    "preRender", "再生前に事前生成", "bool",
+    "全フレームを先に文字列化して再生中の変換遅延を抑える",
+  ),
+  SettingItem(
     "brightness", "明るさ", "text", "-1.0 〜 1.0 の補正値",
     step=0.1, minimum=-1.0, maximum=1.0, base=0.0, decimals=2,
   ),
@@ -145,6 +149,10 @@ VALUE_DESCRIPTIONS: dict[str, dict[Any, str]] = {
     True: "ffplay で音声も鳴らします",
     False: "音声を鳴らしません",
   },
+  "preRender": {
+    True: "再生開始前に全フレームを生成し，途中のカクつきを抑えます",
+    False: "再生しながらフレームを変換します",
+  },
   "cache": {
     True: "ダウンロードしてから再生します．次回からオフラインでも見られます",
     False: "ダウンロードせず直接ストリーミングします",
@@ -191,7 +199,7 @@ def usageLines() -> list[str]:
     f"  {name} <名前>                          登録した動画を再生する",
     f"  {name} list                            登録一覧を表示する",
     f"  {name} show <名前>                     登録内容の詳細を見る",
-    f"  {name} edit <名前> [オプション]        登録内容を変更する",
+    f"  {name} edit <名前>                     設定を選んで変更する（画面が開きます）",
     f"  {name} remove <名前>                   登録を削除する",
     "",
     f"{terminal.BOLD}その他{terminal.RESET_ATTRIBUTES}",
