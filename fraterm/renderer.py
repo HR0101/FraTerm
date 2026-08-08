@@ -103,13 +103,10 @@ def _adjust(image: np.ndarray, brightness: float, contrast: float) -> np.ndarray
 def _resize(frame: np.ndarray, columns: int, rows: int) -> np.ndarray:
   """指定した文字数に合わせてフレームを縮小・拡大する."""
   sourceHeight, sourceWidth = frame.shape[:2]
-  # 縮小時は INTER_AREA，拡大時は INTER_LINEAR のほうが結果が良い
-  interpolation = (
-    cv2.INTER_AREA
-    if columns <= sourceWidth and rows <= sourceHeight
-    else cv2.INTER_LINEAR
-  )
-  return cv2.resize(frame, (columns, rows), interpolation=interpolation)
+  if columns == sourceWidth and rows == sourceHeight:
+    return frame
+  # ターミナル表示では速度と画質のバランスが良い線形補間を使用する
+  return cv2.resize(frame, (columns, rows), interpolation=cv2.INTER_LINEAR)
 
 
 def renderAscii(
@@ -124,16 +121,33 @@ def renderAscii(
   if not charset:
     charset = config.DEFAULT_CHARSET
 
-  grayFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-  smallFrame = _adjust(_resize(grayFrame, columns, rows), brightness, contrast)
+  # 先に縮小してから色変換することで，大きな入力フレーム全体の変換を避ける
+  smallFrame = _resize(frame, columns, rows)
+  grayFrame = (
+    cv2.cvtColor(smallFrame, cv2.COLOR_BGR2GRAY)
+    if smallFrame.ndim == 3
+    else smallFrame
+  )
+  grayFrame = _adjust(grayFrame, brightness, contrast)
+
+  if _native is not None:
+    return _native.renderAscii(grayFrame, charset)
+
+  return _renderAsciiPython(grayFrame, charset)
+
+
+def _renderAsciiPython(grayFrame: np.ndarray, charset: str) -> str:
+  """C拡張を利用できない環境向けにASCII文字列をPythonで組み立てる."""
 
   characterTable = np.array(list(charset))
   lastIndex = len(charset) - 1
   if lastIndex <= 0:
     # 1文字しかない文字セットでも例外にせず，その文字で埋める
-    return "\n".join(charset * columns for _ in range(rows))
+    return "\n".join(
+      charset * grayFrame.shape[1] for _ in range(grayFrame.shape[0])
+    )
 
-  indices = smallFrame.astype(np.uint32) * lastIndex // MAX_PIXEL_VALUE
+  indices = grayFrame.astype(np.uint32) * lastIndex // MAX_PIXEL_VALUE
   characters = characterTable[indices]
   return "\n".join("".join(row) for row in characters)
 
@@ -219,13 +233,15 @@ def renderHalfBlock(
   smallFrame = _resize(colorFrame, columns, rows * 2)
 
   if grayscale:
-    grayFrame = cv2.cvtColor(smallFrame, cv2.COLOR_BGR2GRAY)
-    smallFrame = cv2.cvtColor(grayFrame, cv2.COLOR_GRAY2BGR)
+    smallFrame = cv2.cvtColor(smallFrame, cv2.COLOR_BGR2GRAY)
 
   smallFrame = _adjust(smallFrame, brightness, contrast)
 
   if _native is not None:
     return _native.renderHalfBlock(smallFrame)
+
+  if grayscale:
+    smallFrame = cv2.cvtColor(smallFrame, cv2.COLOR_GRAY2BGR)
 
   return _renderHalfBlockPython(smallFrame)
 
