@@ -33,6 +33,8 @@ SUBCOMMANDS = {
   "play": (),
   "run": (),
   "cache": (),
+  "export": (),
+  "import": (),
   "defaults": ("config",),
   "menu": ("help",),
 }
@@ -185,6 +187,9 @@ DEFAULT_CONTRAST = 1.0
 MIN_SPEED = 0.25
 MAX_SPEED = 4.0
 SPEED_STEP = 0.25
+
+# 再生中の左右キーで移動する秒数
+SEEK_STEP_SECONDS = 10.0
 
 # 音量（ffplay へ渡す0〜100の値）
 DEFAULT_VOLUME = 100

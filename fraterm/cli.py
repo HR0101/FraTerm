@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
 from dataclasses import replace
 
-from . import config, settings, source
+from . import backup, config, settings, source
 from .errors import FraTermError, VideoFileError
 from .errors import NameNotFoundError
 from .registry import (
@@ -102,6 +103,8 @@ URLから再生する（yt-dlp が必要です）:
   {name} add opening "https://www.youtube.com/watch?v=XXXXXXXXXXX" --quality 480
   {name} run "<URL>" -b chrome                       # 年齢制限などの動画
   {name} cache --clear
+  {name} export fraterm-backup.json                  # 設定と登録動画を保存
+  {name} import fraterm-backup.json                  # 別の環境へ復元
 
 毎回のオプションを減らす:
   {name} defaults -m ascii -s detailed -c true -b chrome   # 既定値を保存する
@@ -110,7 +113,7 @@ URLから再生する（yt-dlp が必要です）:
 短縮形: -m モード / -s 文字セット / -c 着色 / -w 幅 / -a 音声 / -q 画質 / -b ブラウザ
 
 再生中の操作:
-  q: 終了 / space: 一時停止・再開 / r: 先頭から / m: ミュート
+  q: 終了 / space: 一時停止・再開 / ←→: 10秒移動 / r: 先頭から / m: ミュート
   +,-: 再生速度 / 9,0: 音量 / s: 保存
 
 URLは引用符で囲んでください（zshでは `?` がエラーになります）．
@@ -529,6 +532,37 @@ def buildParser() -> argparse.ArgumentParser:
   )
   cacheParser.set_defaults(handler=handleCache)
 
+  # export ------------------------------------------------------------------
+  exportParser = subparsers.add_parser(
+    "export",
+    help="設定と登録動画をバックアップする",
+    description="既定値と登録動画を1つのJSONファイルへ書き出します．",
+  )
+  exportParser.add_argument("path", metavar="ファイル", help="バックアップ先のJSONファイル")
+  exportParser.add_argument(
+    "--force", action="store_true", help="既存のバックアップを上書きする"
+  )
+  exportParser.set_defaults(handler=handleExport)
+
+  # import ------------------------------------------------------------------
+  importParser = subparsers.add_parser(
+    "import",
+    help="設定と登録動画を復元する",
+    description="バックアップしたJSONから既定値と登録動画を復元します．",
+  )
+  importParser.add_argument("path", metavar="ファイル", help="読み込むバックアップのJSONファイル")
+  importParser.add_argument(
+    "--force",
+    action="store_true",
+    help="同名の登録動画を上書きする（既定値はマージ）",
+  )
+  importParser.add_argument(
+    "--replace",
+    action="store_true",
+    help="現在の既定値と登録動画をすべて置き換える",
+  )
+  importParser.set_defaults(handler=handleImport)
+
   # defaults ------------------------------------------------------------------
   defaultsParser = subparsers.add_parser(
     "defaults",
@@ -930,6 +964,51 @@ def handleCache(args: argparse.Namespace) -> int:
 
   print(f"合計 {len(files)}件  {formatBytes(totalSize)}")
   print(f"削除するには `{config.commandName()} cache --clear` を実行してください．")
+  return EXIT_OK
+
+
+def handleExport(args: argparse.Namespace) -> int:
+  """既定値と登録動画をバックアップへ書き出す."""
+  target = Path(args.path).expanduser()
+  if target.exists() and not args.force:
+    raise FraTermError(
+      f"バックアップ先がすでに存在します: {target}",
+      hint="上書きする場合は --force を指定してください．",
+    )
+
+  backup.write(target, Registry().load(), settings.load())
+  print(f"バックアップを書き出しました: {target}")
+  return EXIT_OK
+
+
+def handleImport(args: argparse.Namespace) -> int:
+  """バックアップから既定値と登録動画を復元する."""
+  importedEntries, importedDefaults = backup.read(args.path)
+  registry = Registry()
+  currentEntries = registry.load()
+  currentDefaults = settings.load()
+
+  if args.replace:
+    mergedEntries = importedEntries
+    mergedDefaults = importedDefaults
+  else:
+    duplicateNames = sorted(set(currentEntries) & set(importedEntries))
+    if duplicateNames and not args.force:
+      names = "，".join(duplicateNames[:5])
+      if len(duplicateNames) > 5:
+        names += "…"
+      raise FraTermError(
+        f"同名の登録動画がすでにあります: {names}",
+        hint="上書きする場合は --force，すべて置き換える場合は --replace を指定してください．",
+      )
+    mergedEntries = {**currentEntries, **importedEntries}
+    mergedDefaults = {**currentDefaults, **importedDefaults}
+
+  # バックアップ内容の検証はすでに済んでいるため，ここでまとめて保存する
+  registry.save(mergedEntries)
+  settings.save(mergedDefaults)
+  print(f"バックアップを読み込みました: {args.path}")
+  print(f"  登録動画: {len(importedEntries)}件  既定値: {len(importedDefaults)}件")
   return EXIT_OK
 
 
