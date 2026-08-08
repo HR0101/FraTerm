@@ -197,10 +197,11 @@ MIN_VOLUME = 0
 MAX_VOLUME = 100
 VOLUME_STEP = 10
 
-# ffplay が実際に音を出し始めるまでの遅延（実測で0.25〜0.55秒）．
-# 映像の先行を避けるため，測定範囲の上限を既定値にする．環境差による
-# 残りのずれは --audio-offset で調整できる（正の値で音声が先行）．
-AUDIO_START_LATENCY = 0.55
+# ffplayの音声クロックが進捗へ現れるまで待つ最大秒数．通常は固定遅延を
+# 使わず，ffplay自身の進捗位置を映像クロックへ合わせる．
+AUDIO_READY_TIMEOUT = 1.5
+# 旧名称を外部設定との互換性のため残す
+AUDIO_START_LATENCY = AUDIO_READY_TIMEOUT
 
 # 音声と映像のずれを補正する秒数．正の値で音声が先行する
 DEFAULT_AUDIO_OFFSET = 0.0

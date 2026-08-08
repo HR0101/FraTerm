@@ -496,17 +496,29 @@ class Player:
       self._audioPlayer.stop()
       return
 
-    # ffplay の起動遅延の分だけ先の位置から鳴らし，映像と頭出しを揃える
-    startPosition = (
-      self._mediaTime()
-      + config.AUDIO_START_LATENCY * self._speed
-      + self.options.audioOffset
-    )
+    # 音声を現在位置から起動し，ffplay自身の音声クロックが動き始めるまで
+    # 映像側のクロックを進めない．固定遅延を足すだけだと，環境ごとの
+    # ffplay起動時間の差によって映像が先行する．
+    mediaPosition = self._mediaTime()
+    startPosition = mediaPosition + self.options.audioOffset
     self._audioPlayer.start(
       position=startPosition,
       speed=self._speed,
       volume=self._volume,
     )
+
+    waitUntilReady = getattr(self._audioPlayer, "waitUntilReady", None)
+    readyPosition = (
+      waitUntilReady(config.AUDIO_READY_TIMEOUT)
+      if callable(waitUntilReady)
+      else None
+    )
+    if readyPosition is not None:
+      # ffplayの位置は音声側の補正を含むため，映像の位置へ戻す．
+      mediaPosition = max(0.0, readyPosition - self.options.audioOffset)
+
+    self._mediaBase = mediaPosition
+    self._startClock()
 
   # -------------------------------------------------------------------------
   # メインループ

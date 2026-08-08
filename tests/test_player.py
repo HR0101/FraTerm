@@ -375,12 +375,18 @@ class FakeAudioPlayer:
   def __init__(self) -> None:
     self.starts: list[dict] = []
     self.stopCount = 0
+    self.readyPosition: float | None = None
+    self.waitTimeouts: list[float] = []
 
   def start(self, position=0.0, speed=1.0, volume=config.DEFAULT_VOLUME) -> None:
     self.starts.append({"position": position, "speed": speed, "volume": volume})
 
   def stop(self) -> None:
     self.stopCount += 1
+
+  def waitUntilReady(self, timeout=config.AUDIO_READY_TIMEOUT):
+    self.waitTimeouts.append(timeout)
+    return self.readyPosition
 
 
 def makeAudioPlayer(dummyVideo, **optionValues):
@@ -393,22 +399,28 @@ def makeAudioPlayer(dummyVideo, **optionValues):
   return player, fakeAudio
 
 
-def test_audioLatencyUsesConservativeUpperBound():
-  """映像が先行しないよう，実測遅延の上限を既定値にしていることを確認する."""
-  assert config.AUDIO_START_LATENCY >= 0.55
+@pytest.mark.parametrize(
+  "status, expected",
+  [
+    ("   0.55 M-A:  0.000", 0.55),
+    ("\x1b[2K\r   12.345 M-A: -0.001", 12.345),
+    ("    nan M-A:    nan", None),
+    ("audio decoder is ready", None),
+  ],
+)
+def test_audioPositionFromStatus(status, expected):
+  """ffplayの進捗行から音声位置だけを安全に取り出す."""
+  assert audio.audioPositionFromStatus(status) == expected
 
 
-def test_audioStartsAtLatencyCompensatedPosition(dummyVideo):
-  """ffplayの起動遅延を見込んだ位置から音声を開始することを確認する."""
+def test_audioStartsAtCurrentMediaPosition(dummyVideo):
+  """音声を固定補正せず，現在の映像位置から開始することを確認する."""
   player, fakeAudio = makeAudioPlayer(dummyVideo)
   player._mediaTime = lambda: 0.0
   player._syncAudio()
 
   assert len(fakeAudio.starts) == 1
-  # 現在位置よりも起動遅延の分だけ先を指定している
-  assert fakeAudio.starts[0]["position"] == pytest.approx(
-    config.AUDIO_START_LATENCY
-  )
+  assert fakeAudio.starts[0]["position"] == pytest.approx(0.0)
 
 
 def test_audioOffsetShiftsStartPosition(dummyVideo):
@@ -417,9 +429,19 @@ def test_audioOffsetShiftsStartPosition(dummyVideo):
   player._mediaTime = lambda: 0.0
   player._syncAudio()
 
-  assert fakeAudio.starts[0]["position"] == pytest.approx(
-    config.AUDIO_START_LATENCY + 1.5
-  )
+  assert fakeAudio.starts[0]["position"] == pytest.approx(1.5)
+
+
+def test_audioReadyPositionRebasesVideoClock(dummyVideo):
+  """ffplayから受け取った音声位置を基準に映像クロックを合わせる."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo, audioOffset=1.5)
+  player._mediaTime = lambda: 10.0
+  fakeAudio.readyPosition = 12.5
+
+  player._syncAudio()
+
+  assert player._mediaBase == pytest.approx(11.0)
+  assert fakeAudio.waitTimeouts == [config.AUDIO_READY_TIMEOUT]
 
 
 def test_volumeKeysChangeVolume(dummyVideo):
