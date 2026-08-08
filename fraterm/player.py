@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import shutil
 import signal
+import struct
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, TextIO
+from typing import BinaryIO, Callable, TextIO
 
 from . import audio as audioModule
 from . import config, renderer
@@ -51,9 +53,47 @@ BACKSPACE_KEYS = ("\x7f", "\x08")
 
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
+
 # 再生開始前に動画全体の黒帯を確認する代表サンプル数
 BORDER_SCAN_SAMPLES = 12
 
+
+class RenderedFrameStore:
+  """事前生成したフレーム文字列を一時ファイルへ保存する."""
+
+  _HEADER = struct.Struct(">Q")
+
+  def __init__(self) -> None:
+    self._file: BinaryIO = tempfile.TemporaryFile(mode="w+b")
+    self._offsets: list[int] = []
+
+  def append(self, frameText: str) -> None:
+    """フレームを末尾へ追加する."""
+    payload = frameText.encode("utf-8")
+    self._offsets.append(self._file.tell())
+    self._file.write(self._HEADER.pack(len(payload)))
+    self._file.write(payload)
+
+  def read(self, frameIndex: int) -> str | None:
+    """指定番号のフレームを読み込む．範囲外なら None を返す."""
+    if frameIndex < 0 or frameIndex >= len(self._offsets):
+      return None
+    self._file.seek(self._offsets[frameIndex])
+    header = self._file.read(self._HEADER.size)
+    if len(header) != self._HEADER.size:
+      return None
+    payloadSize = self._HEADER.unpack(header)[0]
+    payload = self._file.read(payloadSize)
+    if len(payload) != payloadSize:
+      return None
+    return payload.decode("utf-8")
+
+  def __len__(self) -> int:
+    return len(self._offsets)
+
+  def close(self) -> None:
+    """一時ファイルを閉じて削除する."""
+    self._file.close()
 
 
 @dataclass
@@ -64,6 +104,8 @@ class PlaybackOptions:
   audio: bool = False
   width: int | None = None
   fps: float | None = None
+  # 再生開始前に全フレームを文字列へ変換しておくかどうか
+  preRender: bool = False
   charset: str | None = None
   brightness: float = config.DEFAULT_BRIGHTNESS
   contrast: float = config.DEFAULT_CONTRAST
@@ -87,6 +129,7 @@ class PlaybackOptions:
       audio=entry.audio,
       width=entry.width,
       fps=entry.fps,
+      preRender=entry.preRender,
       charset=entry.charset,
       brightness=entry.brightness,
       contrast=entry.contrast,
@@ -141,6 +184,8 @@ class Player:
     self._lastRenderedMedia: float | None = None
     self._lastSize: tuple[int, int] | None = None
     self._letterboxBounds: tuple[int, int, int, int] | None = None
+    self._preRenderedFrames: RenderedFrameStore | None = None
+    self._preRenderedLayout: tuple[int, int, int, int] | None = None
     self._audioPlayer: audioModule.AudioPlayer | None = None
     self._previousHandlers: dict = {}
     self._keyReader: KeyReader | None = None
@@ -179,12 +224,17 @@ class Player:
     if self._duration <= 0 and self.options.duration:
       # ストリーミング再生ではフレーム数を取得できないため，取得済みの情報を使う
       self._duration = float(self.options.duration)
-    # 動画全体で固定されている黒帯だけを再生前にクロップ対象にする
-    self._letterboxBounds = self._scanPersistentBorders(capture, cv2)
-    # デコードを描画スレッドから分離し，端末出力の一時的な遅延を吸収する
-    self._frameReader = FrameReader(capture)
 
     try:
+      # 動画全体で固定されている黒帯だけを再生前にクロップ対象にする
+      self._letterboxBounds = self._scanPersistentBorders(capture, cv2)
+      if self.options.preRender:
+        # 描画処理を再生前に終え，実際の再生中は文字列の出力だけにする
+        self._preRenderVideo(capture)
+      else:
+        # デコードを描画スレッドから分離し，端末出力の一時的な遅延を吸収する
+        self._frameReader = FrameReader(capture)
+
       self._installSignalHandlers()
       self._prepareTerminal()
       with KeyReader() as keyReader:
@@ -197,6 +247,10 @@ class Player:
       if self._frameReader is not None:
         self._frameReader.close()
         self._frameReader = None
+      if self._preRenderedFrames is not None:
+        self._preRenderedFrames.close()
+        self._preRenderedFrames = None
+        self._preRenderedLayout = None
       capture.release()
       self._capture = None
       self._restoreTerminal()
@@ -318,6 +372,44 @@ class Player:
       persistentEnd(rightValues, frameWidth),
     )
 
+  def _preRenderVideo(self, capture) -> None:
+    """動画を先頭から最後まで変換し，描画用の一時ファイルへ保存する."""
+    terminalWidth, terminalHeight = self._terminalSize()
+    frameStore = RenderedFrameStore()
+    frameCount = 0
+    try:
+      while True:
+        isRead, frame = capture.read()
+        if not isRead or frame is None:
+          break
+
+        frameText, columns, rows, _, _ = self._renderFrameContent(
+          frame, terminalWidth, terminalHeight
+        )
+        frameStore.append(frameText)
+        if frameCount == 0:
+          self._preRenderedLayout = (
+            columns,
+            rows,
+            terminalWidth,
+            terminalHeight,
+          )
+        frameCount += 1
+        if self._isInteractiveStream() and frameCount % 30 == 0:
+          print(f"\r事前生成中: {frameCount}フレーム", end="", file=sys.stderr, flush=True)
+    except Exception:
+      frameStore.close()
+      self._preRenderedLayout = None
+      raise
+
+    if frameCount == 0 or self._preRenderedLayout is None:
+      frameStore.close()
+      raise PlaybackError("事前生成できるフレームがありません．")
+
+    self._preRenderedFrames = frameStore
+    if self._isInteractiveStream():
+      print(f"\r事前生成完了: {frameCount}フレーム" + " " * 10, file=sys.stderr)
+
   # -------------------------------------------------------------------------
   # 再生クロック
   # -------------------------------------------------------------------------
@@ -399,12 +491,19 @@ class Player:
           return
         continue
 
-      frame = self._readFrame()
-      if frame is None:
-        return
+      if self._preRenderedFrames is not None:
+        frameText = self._readPreparedFrame()
+        if frameText is None:
+          return
+        self._lastRenderedMedia = frameTime
+        self._drawPreparedFrame(frameText)
+      else:
+        frame = self._readFrame()
+        if frame is None:
+          return
 
-      self._lastRenderedMedia = frameTime
-      self._drawFrame(frame)
+        self._lastRenderedMedia = frameTime
+        self._drawFrame(frame)
 
   def _processPendingKeys(self, keyReader: KeyReader) -> bool:
     """溜まっているキー入力をすべて処理する．終了要求があれば偽を返す."""
@@ -434,6 +533,11 @@ class Player:
 
   def _grabFrame(self) -> bool:
     """フレームをデコードせずに1つ読み進める."""
+    if self._preRenderedFrames is not None:
+      if self._nextFrameIndex >= len(self._preRenderedFrames):
+        return False
+      self._nextFrameIndex += 1
+      return True
     if self._frameReader is not None:
       packet = self._frameReader.read()
       if packet is None:
@@ -444,6 +548,16 @@ class Player:
       return False
     self._nextFrameIndex += 1
     return True
+
+  def _readPreparedFrame(self) -> str | None:
+    """事前生成済みフレームを1つ読み込む."""
+    if self._preRenderedFrames is None:
+      return None
+    frameText = self._preRenderedFrames.read(self._nextFrameIndex)
+    if frameText is None:
+      return None
+    self._nextFrameIndex += 1
+    return frameText
 
   def _readFrame(self):
     """フレームを1つ読み込む．動画の終端では None を返す."""
@@ -520,12 +634,13 @@ class Player:
 
   def _restart(self) -> None:
     """再生位置を先頭へ戻す."""
-    import cv2
+    if self._preRenderedFrames is None:
+      import cv2
 
-    if self._frameReader is not None:
-      self._frameReader.seek(cv2.CAP_PROP_POS_FRAMES)
-    elif self._capture is not None:
-      self._capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+      if self._frameReader is not None:
+        self._frameReader.seek(cv2.CAP_PROP_POS_FRAMES)
+      elif self._capture is not None:
+        self._capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
     self._nextFrameIndex = 0
     self._lastRenderedMedia = None
     self._mediaBase = 0.0
@@ -609,9 +724,14 @@ class Player:
     """ステータス行の位置へ，入力欄やメッセージを表示する."""
     if self._lastSize is None:
       return
-    _, rows, terminalWidth, _ = self._lastSize
+    columns, rows, terminalWidth, terminalHeight = self._lastSize
+    topOffset, _ = self._frameOffsets(
+      columns, rows, terminalWidth, terminalHeight
+    )
     body = truncateToWidth(sanitizeText(text), max(0, terminalWidth))
-    self._write(f"{ESC}[{rows + 1};1H{body}{RESET_ATTRIBUTES}{CLEAR_LINE}")
+    self._write(
+      f"{ESC}[{topOffset + rows + 1};1H{body}{RESET_ATTRIBUTES}{CLEAR_LINE}"
+    )
 
   def _changeVolume(self, delta: int) -> None:
     """音量を変更する．音声を使わない再生では何もしない."""
@@ -678,6 +798,18 @@ class Player:
 
   def _drawFrame(self, frame) -> None:
     """1フレーム分の文字列を組み立てて出力する."""
+    frameText, columns, rows, terminalWidth, terminalHeight = self._renderFrameContent(frame)
+    self._writeRenderedFrame(
+      frameText, columns, rows, terminalWidth, terminalHeight
+    )
+
+  def _renderFrameContent(
+    self,
+    frame,
+    terminalWidth: int | None = None,
+    terminalHeight: int | None = None,
+  ) -> tuple[str, int, int, int, int]:
+    """フレームをクロップ・サイズ計算・文字列化する."""
     if self._letterboxBounds is None:
       self._letterboxBounds = (0, frame.shape[0], 0, frame.shape[1])
     top, bottom, left, right = self._letterboxBounds
@@ -686,7 +818,8 @@ class Player:
       frame = frame[top:bottom, left:right]
 
     frameHeight, frameWidth = frame.shape[:2]
-    terminalWidth, terminalHeight = self._terminalSize()
+    if terminalWidth is None or terminalHeight is None:
+      terminalWidth, terminalHeight = self._terminalSize()
     columns, rows = renderer.computeSize(
       frameWidth,
       frameHeight,
@@ -696,13 +829,6 @@ class Player:
       # ステータス行を出さない場合は，その1行も描画に使う
       reservedRows=config.STATUS_ROW_COUNT if self.options.showStatus else 0,
     )
-
-    parts: list[str] = []
-    currentSize = (columns, rows, terminalWidth, terminalHeight)
-    if currentSize != self._lastSize:
-      # サイズが変わったときだけ画面を消し，残像を防ぐ
-      parts.append(CLEAR_SCREEN)
-      self._lastSize = currentSize
 
     frameText = renderer.renderFrame(
       frame,
@@ -714,24 +840,77 @@ class Player:
       self.options.contrast,
       self.options.color,
     )
+    return frameText, columns, rows, terminalWidth, terminalHeight
+
+  def _drawPreparedFrame(self, frameText: str) -> None:
+    """事前生成済みの文字列を出力する."""
+    if self._preRenderedLayout is None:
+      return
+    columns, rows, terminalWidth, terminalHeight = self._preRenderedLayout
+    self._writeRenderedFrame(
+      frameText, columns, rows, terminalWidth, terminalHeight
+    )
+
+  def _writeRenderedFrame(
+    self,
+    frameText: str,
+    columns: int,
+    rows: int,
+    terminalWidth: int,
+    terminalHeight: int,
+  ) -> None:
+    """文字列化済みフレームを端末へ描画する."""
+
+    parts: list[str] = []
+    currentSize = (columns, rows, terminalWidth, terminalHeight)
+    if currentSize != self._lastSize:
+      # サイズが変わったときだけ画面を消し，残像を防ぐ
+      parts.append(CLEAR_SCREEN)
+      self._lastSize = currentSize
 
     parts.append(CURSOR_HOME)
-    parts.append(frameText.replace("\n", f"{CLEAR_LINE}\n"))
+    topOffset, leftOffset = self._frameOffsets(
+      columns, rows, terminalWidth, terminalHeight
+    )
+    if topOffset > 0:
+      parts.append(f"{ESC}[{topOffset + 1};1H")
+    linePrefix = " " * leftOffset
+    parts.append(
+      linePrefix + frameText.replace("\n", f"{CLEAR_LINE}\n{linePrefix}")
+    )
     parts.append(CLEAR_LINE)
 
     if self.options.showStatus:
-      parts.append(self._statusText(rows, terminalWidth))
+      parts.append(self._statusText(rows, terminalWidth, topOffset))
 
     self._write("".join(parts))
+
+  def _frameOffsets(
+    self,
+    columns: int,
+    rows: int,
+    terminalWidth: int,
+    terminalHeight: int,
+  ) -> tuple[int, int]:
+    """描画領域内で映像を中央へ置く余白（上，左）を返す."""
+    availableRows = terminalHeight - (
+      config.STATUS_ROW_COUNT if self.options.showStatus else 0
+    )
+    topOffset = max(0, (availableRows - rows) // 2)
+    leftOffset = max(0, (terminalWidth - columns) // 2)
+    return topOffset, leftOffset
 
   def _drawStatusOnly(self) -> None:
     """一時停止中に，ステータス行だけを更新する."""
     if not self.options.showStatus or self._lastSize is None:
       return
-    _, rows, terminalWidth, _ = self._lastSize
-    self._write(self._statusText(rows, terminalWidth))
+    columns, rows, terminalWidth, terminalHeight = self._lastSize
+    topOffset, _ = self._frameOffsets(
+      columns, rows, terminalWidth, terminalHeight
+    )
+    self._write(self._statusText(rows, terminalWidth, topOffset))
 
-  def _statusText(self, rows: int, terminalWidth: int) -> str:
+  def _statusText(self, rows: int, terminalWidth: int, rowOffset: int = 0) -> str:
     """画面下部に表示するステータス行を組み立てる."""
     state = "一時停止" if self._paused else "再生中"
     position = formatTime(self._mediaTime())
@@ -751,8 +930,8 @@ class Player:
     )
     body = truncateToWidth(body, max(0, terminalWidth))
 
-    # ステータス行は描画領域のすぐ下（1始まりの行番号）へ表示する
-    return f"{ESC}[{rows + 1};1H{DIM}{body}{RESET_ATTRIBUTES}{CLEAR_LINE}"
+    # ステータス行は中央配置した描画領域のすぐ下へ表示する
+    return f"{ESC}[{rowOffset + rows + 1};1H{DIM}{body}{RESET_ATTRIBUTES}{CLEAR_LINE}"
 
   def _write(self, text: str) -> None:
     """出力先へ書き込む．端末が閉じられている場合は再生を終了させる."""

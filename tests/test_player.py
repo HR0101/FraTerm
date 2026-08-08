@@ -194,6 +194,29 @@ def test_playRespectsFpsLimit(sampleVideo):
   assert limitedFrames < baseFrames
 
 
+def test_preRenderGeneratesFramesBeforePlayback(sampleVideo):
+  """事前生成を有効にしても全フレームが順番に描画されることを確認する."""
+  stream = io.StringIO()
+  options = PlaybackOptions(width=40, preRender=True, title="sample")
+
+  Player(sampleVideo, options, stream=stream).play()
+
+  assert stream.getvalue().count("\x1b[H") == 10
+  assert stream.getvalue().endswith("\x1b[0m\n")
+
+
+def test_renderedFrameIsCenteredInTerminal(dummyVideo):
+  """映像が端末の上下左右の中央へ配置されることを確認する."""
+  stream = io.StringIO()
+  player = Player(dummyVideo, PlaybackOptions(showStatus=False), stream=stream)
+
+  player._writeRenderedFrame("aa\nbb", 2, 2, 10, 8)
+
+  output = stream.getvalue()
+  assert "\x1b[4;1H" in output  # 上余白3行の4行目から描画
+  assert "    aa\x1b[K\n    bb" in output  # 左余白4桁を各行へ適用
+
+
 class FakeAudioPlayer:
   """ffplay を起動せず，呼び出し内容だけを記録するテスト用の音声プレイヤー."""
 
