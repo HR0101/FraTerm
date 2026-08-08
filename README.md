@@ -97,8 +97,8 @@ sudo apt install ffmpeg    # Ubuntu
 
 | コマンド | 別名 | 引数 | 内容 |
 |---|---|---|---|
-| `fraterm run` | — | `<ファイル/URL>` | 登録せずに再生する |
-| `fraterm play` | — | `<登録名>` | 登録した動画を再生する |
+| `fraterm run` | — | `<ファイル/URL/登録名>` | 動画を再生する |
+| `fraterm play` | — | `<登録名/ファイル/URL>` | 動画を再生する（`run` と同じ動作） |
 | `fraterm <登録名>` | — | — | `play` の省略形 |
 | `fraterm add` | — | `<登録名> <ファイル/URL>` | 名前を付けて登録する |
 | `fraterm list` | `ls` | — | 登録一覧を表示する |
@@ -147,22 +147,22 @@ fraterm add neko ~/Videos/cat.mp4 --mode color --audio --width 100
 
 ### 再生する
 
-登録名だけで再生できます．
+**`run` と `play` は同じ動作**です．登録名・ファイル・URL のどれを渡しても再生できます．
 
 ```bash
-fraterm badapple
+fraterm badapple                      # 登録名だけ（play の省略形）
+fraterm play badapple                 # 明示的に書く場合
+fraterm run badapple                  # run でも同じ
+fraterm run ~/Videos/sample.mp4       # ファイル
+fraterm play "https://youtu.be/XXXX"  # URL
 ```
 
-明示的に `play` を書く形式も使えます．オプションを付けると，その回だけ設定を上書きできます（登録内容は変わりません）．
+どちらを使うか迷わずに済むよう，指定された文字列から自動で判別します（URL → 登録名 → ファイルの順に照合します）．
+
+オプションを付けると，その回だけ設定を上書きできます（登録内容は変わりません）．
 
 ```bash
 fraterm play badapple --mode color --width 80
-```
-
-登録せずにファイルを直接再生することもできます．
-
-```bash
-fraterm run ~/Videos/sample.mp4 --mode color
 ```
 
 ### URLから再生する

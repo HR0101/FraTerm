@@ -36,7 +36,11 @@ DIM = f"{ESC}[2m"
 TERMINATION_SIGNALS = ("SIGTERM", "SIGHUP")
 
 # 再生中に表示する操作説明
-KEY_HELP = "[q/Esc]終了 [space]一時停止 [←/→]移動 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [s]保存"
+KEY_HELP = "[q/Esc]終了 [space]一時停止 [0-9]位置 [←/→]移動 [r]先頭 [m]消音 [+/-]速度 [[/]]音量 [s]保存"
+
+# 数字キーを動画位置へ割り当てるため，音量操作は角括弧へ移す
+VOLUME_DOWN_KEY = "["
+VOLUME_UP_KEY = "]"
 
 # エラー表示でURLを短く見せるときの幅
 MAX_SOURCE_LABEL_WIDTH = 60
@@ -657,11 +661,22 @@ class Player:
       self._changeSpeed(-config.SPEED_STEP)
       return True
 
-    if key == "0":
+    if key in "0123456789":
+      if self._duration > 0:
+        # 0〜9 は動画の 0〜90% の位置へ移動する
+        self._seekToFraction(int(key) / 10.0)
+      elif key == "0":
+        # 長さを取得できないストリームではシークできないため旧操作を維持する
+        self._changeVolume(config.VOLUME_STEP)
+      elif key == "9":
+        self._changeVolume(-config.VOLUME_STEP)
+      return True
+
+    if key == VOLUME_UP_KEY:
       self._changeVolume(config.VOLUME_STEP)
       return True
 
-    if key == "9":
+    if key == VOLUME_DOWN_KEY:
       self._changeVolume(-config.VOLUME_STEP)
       return True
 
@@ -698,7 +713,17 @@ class Player:
 
   def _seekBy(self, seconds: float) -> None:
     """現在位置から指定秒数だけ前後へ移動する."""
-    target = max(0.0, self._mediaTime() + seconds)
+    self._seekTo(self._mediaTime() + seconds)
+
+  def _seekToFraction(self, fraction: float) -> None:
+    """動画全体に対する割合（0.0〜1.0）で位置を指定する."""
+    if self._duration <= 0:
+      return
+    self._seekTo(self._duration * fraction)
+
+  def _seekTo(self, target: float) -> None:
+    """指定した動画内の時刻へ移動し，映像と音声の基準を更新する."""
+    target = max(0.0, target)
     if self._duration > 0:
       target = min(target, self._duration)
 

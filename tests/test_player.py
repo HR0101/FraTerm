@@ -181,6 +181,94 @@ def test_seekKeysUseTenSecondStep(dummyVideo):
   ]
 
 
+def test_renderedSizeFollowsTerminal(sampleVideo):
+  """同じ動画が，端末の大きさに応じた文字数で描かれることを確認する."""
+  from fraterm import renderer
+
+  frameWidth, frameHeight = 320, 240
+  small = renderer.computeSize(frameWidth, frameHeight, 80, 24)
+  large = renderer.computeSize(frameWidth, frameHeight, 160, 50)
+
+  assert large[0] > small[0] and large[1] > small[1]
+  # どちらも元の縦横比を保っている（文字セルの縦横比を考慮する）
+  for columns, rows in (small, large):
+    shownAspect = columns / (rows * config.CELL_ASPECT_RATIO)
+    assert abs(shownAspect - frameWidth / frameHeight) < 0.15
+
+
+def test_savedWidthCapsLargerTerminal(sampleVideo):
+  """幅を指定して登録すると，大きい端末でもその幅で止まることを確認する."""
+  from fraterm import renderer
+
+  columns, _ = renderer.computeSize(320, 240, 160, 50, maxWidth=50)
+  assert columns == 50
+
+
+def test_preRenderedLayoutDetectsTerminalResize(dummyVideo, monkeypatch):
+  """事前生成後に端末サイズが変わったことを検出できることを確認する."""
+  player = Player(dummyVideo, PlaybackOptions(preRender=True), stream=io.StringIO())
+  player._preRenderedLayout = (60, 20, 80, 24)
+
+  monkeypatch.setattr(player, "_terminalSize", lambda: (80, 24))
+  assert player._terminalSizeChanged() is False
+
+  monkeypatch.setattr(player, "_terminalSize", lambda: (160, 50))
+  assert player._terminalSizeChanged() is True
+
+
+def test_noResizeDetectionWithoutPreRender(dummyVideo):
+  """事前生成していない場合は，切り替えの判定を行わないことを確認する."""
+  player = Player(dummyVideo, stream=io.StringIO())
+  assert player._terminalSizeChanged() is False
+
+
+def test_resizeSwitchesToLiveRendering(sampleVideo, monkeypatch):
+  """端末サイズが変わったら，その位置から通常描画へ切り替わることを確認する."""
+  player = Player(sampleVideo, PlaybackOptions(preRender=True), stream=io.StringIO())
+
+  store = __import__("fraterm.player", fromlist=["x"]).RenderedFrameStore()
+  store.append("古い生成結果")
+  player._preRenderedFrames = store
+  player._preRenderedLayout = (60, 20, 80, 24)
+  player._nextFrameIndex = 3
+
+  assert player._switchToLiveRendering() is True
+
+  # 事前生成の結果は破棄され，現在位置から読み直す状態になる
+  assert player._preRenderedFrames is None
+  assert player._preRenderedLayout is None
+  assert player._frameReader is not None
+  assert player._lastSize is None
+
+  if player._frameReader is not None:
+    player._frameReader.close()
+  if player._capture is not None:
+    player._capture.release()
+
+
+def test_resizeKeepsPlayingWhenSourceCannotBeReopened(dummyVideo, monkeypatch):
+  """開き直せない場合でも，再生を止めずに続けることを確認する."""
+  import fraterm.player as playerModule
+
+  player = Player(
+    "https://example.invalid/video.mp4",
+    PlaybackOptions(preRender=True),
+    stream=io.StringIO(),
+  )
+  store = playerModule.RenderedFrameStore()
+  store.append("生成済みのフレーム")
+  player._preRenderedFrames = store
+  player._preRenderedLayout = (60, 20, 80, 24)
+  monkeypatch.setattr(player, "_terminalSize", lambda: (100, 30))
+
+  # 開き直せない場合は偽を返し，事前生成の結果を保ったまま続行する
+  assert player._switchToLiveRendering() is False
+  assert player._preRenderedFrames is store
+  assert player._preRenderedLayout == (60, 20, 100, 30)
+
+  store.close()
+
+
 class FakeCapture:
   """OpenCV の VideoCapture を模したテスト用のクラス."""
 
