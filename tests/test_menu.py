@@ -140,11 +140,32 @@ def test_arrowKeysAreNotInsertedIntoInput(isolatedHome):
   assert settings.load()["width"] == 80
 
 
-def test_quitKeyStopsMenu():
-  """qキーで終了することを確認する."""
+@pytest.mark.parametrize("key", ["q", "Q", "\x1b"])
+def test_quitKeysStopMenu(key):
+  """q と Esc でメニューを閉じられることを確認する."""
   screen = makeMenu()
-  assert screen.handleKey("q") is False
+  assert screen.handleKey(key) is False
+
+
+def test_otherKeysKeepMenuOpen():
+  """終了以外のキーではメニューが開いたままであることを確認する."""
+  screen = makeMenu()
   assert screen.handleKey("j") is True
+
+
+def test_escapeCancelsEditingInsteadOfQuitting(isolatedHome):
+  """値の入力中は，Escが終了ではなく取り消しになることを確認する."""
+  screen = settingsScreen("width")
+  screen.handleKey("\r")
+  screen.handleKey("5")
+
+  # 入力中の Esc はメニューを閉じない
+  assert screen.handleKey("\x1b") is True
+  assert screen.state.editing is False
+  assert "width" not in settings.load()
+
+  # 入力を抜けたあとの Esc は終了になる
+  assert screen.handleKey("\x1b") is False
 
 
 def test_itemMovementOnlyInSettingsTab():
