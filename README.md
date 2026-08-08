@@ -39,17 +39,41 @@ ft badapple
 
 ## インストール
 
-リポジトリのルートで次を実行します．
+`git clone` したあと，セットアップスクリプトを実行するだけで準備が整います．
+
+```bash
+git clone https://github.com/HR0101/FraTerm.git
+cd FraTerm
+./setup.sh --all
+```
+
+仮想環境の作成，依存ライブラリの導入，外部ツールの確認，動作確認までを一度に行います．
+
+| オプション | 内容 |
+|---|---|
+| （なし） | Python の依存関係（opencv-python，numpy，yt-dlp）のみ導入します |
+| `--with-tools` | ffmpeg と Deno も導入します（Homebrew / apt / dnf を使用） |
+| `--dev` | テスト用のライブラリ（pytest など）も導入します |
+| `--link` | `fraterm` と `ft` を `~/.local/bin` へ登録し，どこからでも使えるようにします |
+| `--all` | 上の3つをまとめて指定します |
+
+何度実行しても問題ありません（既存の仮想環境はそのまま使います）．最後に動作環境の確認結果が表示されます．
+
+```text
+==> 準備ができました
+    ✓ Python: 3.12.6
+    ✓ OpenCV: 5.0.0
+    ✓ yt-dlp: モジュールとして利用可能
+    ✓ JavaScript: node v22.9.0
+    ✓ ffplay: ffplay version 8.1.2
+    ✓ C拡張: 有効（描画が高速です）
+```
+
+### 手動で導入する場合
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
-```
-
-URLからの再生を使う場合は，`yt-dlp` も導入します．
-
-```bash
 python -m pip install -e ".[youtube]"
 ```
 
@@ -82,6 +106,8 @@ sudo apt install ffmpeg    # Ubuntu
 | `fraterm edit` | — | `<登録名>` | 登録内容を変更する（オプション無しで編集画面が開きます） |
 | `fraterm remove` | `rm` `delete` | `<登録名>` | 登録を削除する（動画ファイルは消しません） |
 | `fraterm cache` | — | — | ダウンロード済み動画の一覧と削除 |
+| `fraterm export` | — | `<ファイル>` | 設定と登録動画をバックアップする |
+| `fraterm import` | — | `<ファイル>` | バックアップから設定と登録動画を復元する |
 | `fraterm defaults` | `config` | — | 毎回のオプションの既定値を設定する |
 | `fraterm menu` | `help` | — | 使い方と設定を全画面で表示する |
 | `fraterm --version` | — | — | バージョンを表示する |
@@ -98,6 +124,8 @@ sudo apt install ffmpeg    # Ubuntu
 | `edit` | すべて使えます | — |
 | `defaults` | すべて使えます | `--clear` |
 | `cache` | — | `--clear` |
+| `export` | — | `--force` |
+| `import` | — | `--force` / `--replace` |
 | `list` / `show` / `remove` / `menu` | — | — |
 
 「再生・表示のオプション」の内容は，後述の[オプション](#オプション)を参照してください．
@@ -161,6 +189,20 @@ fraterm add zoo https://www.youtube.com/watch?v=XXXXXXXXXXX --cache
 fraterm cache           # キャッシュの一覧と合計サイズ
 fraterm cache --clear   # キャッシュをすべて削除
 ```
+
+### 設定をバックアップ・移行する
+
+既定値と登録動画を1つのJSONへ保存できます．JSONには動画ファイルのパスやURL，
+Cookieファイルのパスが含まれますが，Cookieそのものは保存されません．
+
+```bash
+fraterm export fraterm-backup.json
+fraterm import fraterm-backup.json
+fraterm import fraterm-backup.json --replace  # 現在の設定をすべて置き換える
+```
+
+既存の登録名がある場合，通常の復元は停止します．上書きする場合は `--force` を指定してください．
+バックアップファイルは認証情報を含む可能性があるため，安全な場所で管理してください．
 
 なお直接リンクは数時間で失効するため，登録内容には元のURLを保存し，再生のたびに解決し直します．動画の視聴にあたっては，各サイトの利用規約と著作権を尊重してご利用ください．
 
@@ -242,6 +284,7 @@ $ fraterm myvide
 | `q` / `Esc` | 再生を終了する |
 | `Space` | 一時停止・再開する |
 | `r` | 先頭から再生し直す |
+| `←` / `→` または `h` / `l` | 10秒前後へ移動する |
 | `m` | ミュートを切り替える（`--audio` 指定時のみ） |
 | `+` | 再生速度を上げる |
 | `-` | 再生速度を下げる |
@@ -489,6 +532,7 @@ python -m benchmarks.benchmark_renderer
 | `fraterm/config.py` | 設定ファイルの場所と共通定数 |
 | `fraterm/menu.py` | 使い方と設定の全画面メニュー |
 | `fraterm/settings.py` | オプションの既定値の保存 |
+| `fraterm/backup.py` | 設定と登録動画のバックアップ・復元 |
 | `fraterm/diagnostics.py` | 依存ツールと保存先の診断 |
 | `fraterm/terminal.py` | 端末制御のエスケープシーケンス |
 | `fraterm/textwidth.py` | 全角文字を考慮した表示幅の計算 |
@@ -496,9 +540,9 @@ python -m benchmarks.benchmark_renderer
 
 ## 既知の制限
 
-- 音声は `ffplay` の別プロセスで再生するため，一時停止・速度変更・音量変更のたびに現在位置から再生し直します．`ffplay` の起動には0.25〜0.55秒ほどかかるので，その分だけ先の位置から鳴らして頭出しを合わせています．ずれを感じる場合は `--audio-offset` で微調整してください（正の値で音声が先行します）．
+- 音声は `ffplay` の別プロセスで再生するため，一時停止・速度変更・音量変更のたびに現在位置から再生し直します．`ffplay` の起動には0.25〜0.55秒ほどかかるので，映像が先行しないよう上限の0.55秒を見込んで先の位置から鳴らします．ずれを感じる場合は `--audio-offset` で微調整してください（正の値で音声が先行します）．
 - `--fps` は上限の指定です．動画のFPSの約数に丸められるため，指定値ちょうどにはなりません．
-- `--pre-render` は再生開始前に動画全体を変換するため，長い動画では開始まで時間がかかります．変換結果は一時ファイルに保存し，再生中のメモリ使用量を抑えます．端末サイズは生成開始時のものを使うため，サイズを変えた場合は再生し直してください．
+- `--pre-render` は再生開始前に動画全体を変換するため，長い動画では開始まで時間がかかります．変換結果は一時ファイルに保存し，再生中のメモリ使用量を抑えます．再生中に端末サイズを変えた場合は，現在位置から通常描画へ切り替えて新しいサイズへ追従します．
 - URL再生では，映像と音声が1つにまとまった形式のみを選びます．YouTubeの場合は360p前後が上限になることが多く，`--quality 720` を指定しても自動的に下位の形式へ切り替わります（端末表示では実用上ほとんど差がありません）．
 - ダウンロードの進捗は表示されません．長い動画に `--cache` を指定した場合は，完了までしばらく待つ必要があります．
 - URLの解決には数秒〜1分程度かかります．特に `--cookies-from-browser` はブラウザのCookieを毎回すべて読み出すため時間がかかります．繰り返し見る動画は `--cache` で保存すると2回目以降は待ち時間がなくなります．

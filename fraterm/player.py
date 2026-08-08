@@ -16,7 +16,7 @@ from . import audio as audioModule
 from . import config, renderer
 from .errors import PlaybackError, VideoFileError
 from .frame_reader import FrameReader
-from .keyboard import KeyReader
+from .keyboard import KEY_LEFT, KEY_RIGHT, KeyReader
 from .registry import VideoEntry
 from .textwidth import sanitizeText, truncateToWidth
 
@@ -36,7 +36,10 @@ DIM = f"{ESC}[2m"
 TERMINATION_SIGNALS = ("SIGTERM", "SIGHUP")
 
 # 再生中に表示する操作説明
-KEY_HELP = "[q/Esc]終了 [space]一時停止 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [s]保存"
+KEY_HELP = "[q/Esc]終了 [space]一時停止 [←/→]移動 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [s]保存"
+
+# エラー表示でURLを短く見せるときの幅
+MAX_SOURCE_LABEL_WIDTH = 60
 
 # 保存名として受け付ける最大文字数
 MAX_INPUT_LENGTH = 40
@@ -182,7 +185,7 @@ class Player:
     self._duration = 0.0
     self._nextFrameIndex = 0
     self._lastRenderedMedia: float | None = None
-    self._lastSize: tuple[int, int] | None = None
+    self._lastSize: tuple[int, int, int, int] | None = None
     self._letterboxBounds: tuple[int, int, int, int] | None = None
     self._preRenderedFrames: RenderedFrameStore | None = None
     self._preRenderedLayout: tuple[int, int, int, int] | None = None
@@ -210,12 +213,7 @@ class Player:
       audioModule.ensureAvailable()
       self._audioPlayer = audioModule.AudioPlayer(self.videoPath)
 
-    capture = cv2.VideoCapture(self.videoPath)
-    if not capture.isOpened():
-      raise PlaybackError(
-        f"動画ファイルを読み込めません: {self.videoPath}",
-        hint="対応していない形式か，ファイルが壊れている可能性があります．",
-      )
+    capture = self._openCapture(cv2)
 
     self._capture = capture
     self._letterboxBounds = None
@@ -251,10 +249,66 @@ class Player:
         self._preRenderedFrames.close()
         self._preRenderedFrames = None
         self._preRenderedLayout = None
-      capture.release()
-      self._capture = None
+      if self._capture is not None:
+        self._capture.release()
+        self._capture = None
       self._restoreTerminal()
       self._restoreSignalHandlers()
+
+  # -------------------------------------------------------------------------
+  # 動画を開く
+  # -------------------------------------------------------------------------
+
+  def _sourceLabel(self) -> str:
+    """エラー表示に使う，短くて分かりやすい入力名を返す."""
+    if not config.isUrl(self.videoPath):
+      return self.videoPath
+    if self.options.title:
+      return self.options.title
+    return truncateToWidth(self.videoPath, MAX_SOURCE_LABEL_WIDTH) + "…"
+
+  @staticmethod
+  def _quietOpenCvLogging(cv2Module) -> None:
+    """OpenCVの警告表示を抑える．失敗の理由は自前のメッセージで伝える."""
+    try:
+      logging = cv2Module.utils.logging
+      logging.setLogLevel(logging.LOG_LEVEL_ERROR)
+    except AttributeError:
+      # 対応していない版では何もしない
+      pass
+
+  def _openCapture(self, cv2Module):
+    """動画を開く．URLは一時的に失敗することがあるため何度か試す."""
+    self._quietOpenCvLogging(cv2Module)
+    isRemote = config.isUrl(self.videoPath)
+
+    # URLで自動選択に任せると，開けなかったときに連番画像として解釈し直し，
+    # 本当の原因が分からないエラーになる．FFmpegを明示して防ぐ
+    backend = cv2Module.CAP_FFMPEG if isRemote else cv2Module.CAP_ANY
+    attempts = config.REMOTE_OPEN_ATTEMPTS if isRemote else 1
+
+    for attempt in range(1, attempts + 1):
+      capture = cv2Module.VideoCapture(self.videoPath, backend)
+      if capture.isOpened():
+        return capture
+
+      capture.release()
+      if attempt < attempts:
+        print(
+          f"読み込めなかったため再試行します（{attempt}/{attempts - 1}）．",
+          file=sys.stderr,
+        )
+        time.sleep(config.REMOTE_OPEN_RETRY_DELAY)
+
+    raise PlaybackError(
+      f"動画を読み込めません: {self._sourceLabel()}",
+      hint=(
+        "通信が不安定な可能性があります．"
+        "`--cache` を付けると，ダウンロードしてから再生するので安定します．"
+        if isRemote
+        else "対応していない形式か，ファイルが壊れている可能性があります．"
+      ),
+    )
 
   # -------------------------------------------------------------------------
   # 終了シグナルの処理
@@ -474,6 +528,11 @@ class Player:
           return
         continue
 
+      if self._preRenderedFrames is not None and self._terminalSizeChanged():
+        # 事前生成した文字列は端末サイズに依存するため，サイズ変更後は
+        # 現在位置から通常のフレーム読み込みへ安全に切り替える．
+        self._switchToLiveRendering()
+
       if not self._advanceToTargetFrame():
         return
 
@@ -559,6 +618,45 @@ class Player:
     self._nextFrameIndex += 1
     return frameText
 
+  def _terminalSizeChanged(self) -> bool:
+    """事前生成を開始した時点から端末サイズが変わったかどうかを返す."""
+    if self._preRenderedLayout is None:
+      return False
+    return self._terminalSize() != self._preRenderedLayout[2:]
+
+  def _switchToLiveRendering(self) -> bool:
+    """端末サイズ変更時に，現在位置から通常描画へ切り替える."""
+    if self._preRenderedFrames is None:
+      return True
+
+    import cv2
+
+    newCapture = cv2.VideoCapture(self.videoPath)
+    if not newCapture.isOpened():
+      newCapture.release()
+      # 再接続できないURLなどでは，古い生成結果を新しい端末の中央へ置く
+      # ことで再生を止めずに継続する．
+      terminalWidth, terminalHeight = self._terminalSize()
+      columns, rows, _, _ = self._preRenderedLayout or (0, 0, 0, 0)
+      self._preRenderedLayout = (columns, rows, terminalWidth, terminalHeight)
+      self._lastSize = None
+      return False
+
+    newReader = FrameReader(newCapture)
+    newReader.seek(cv2.CAP_PROP_POS_FRAMES, self._nextFrameIndex)
+
+    oldCapture = self._capture
+    oldStore = self._preRenderedFrames
+    self._frameReader = newReader
+    self._capture = newCapture
+    self._preRenderedFrames = None
+    self._preRenderedLayout = None
+    self._lastSize = None
+    oldStore.close()
+    if oldCapture is not None and oldCapture is not newCapture:
+      oldCapture.release()
+    return True
+
   def _readFrame(self):
     """フレームを1つ読み込む．動画の終端では None を返す."""
     if self._frameReader is not None:
@@ -594,6 +692,14 @@ class Player:
 
     if lowerKey == "r":
       self._restart()
+      return True
+
+    if key in (KEY_LEFT, "h"):
+      self._seekBy(-config.SEEK_STEP_SECONDS)
+      return True
+
+    if key in (KEY_RIGHT, "l"):
+      self._seekBy(config.SEEK_STEP_SECONDS)
       return True
 
     if lowerKey == "m":
@@ -644,6 +750,29 @@ class Player:
     self._nextFrameIndex = 0
     self._lastRenderedMedia = None
     self._mediaBase = 0.0
+    self._startClock()
+    self._syncAudio()
+
+  def _seekBy(self, seconds: float) -> None:
+    """現在位置から指定秒数だけ前後へ移動する."""
+    target = max(0.0, self._mediaTime() + seconds)
+    if self._duration > 0:
+      target = min(target, self._duration)
+
+    frameIndex = max(0, int(target * self._videoFps))
+    if self._preRenderedFrames is not None:
+      frameIndex = min(frameIndex, len(self._preRenderedFrames))
+    else:
+      import cv2
+
+      if self._frameReader is not None:
+        self._frameReader.seek(cv2.CAP_PROP_POS_FRAMES, frameIndex)
+      elif self._capture is not None:
+        self._capture.set(cv2.CAP_PROP_POS_FRAMES, frameIndex)
+
+    self._nextFrameIndex = frameIndex
+    self._lastRenderedMedia = None
+    self._mediaBase = target
     self._startClock()
     self._syncAudio()
 

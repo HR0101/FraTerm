@@ -50,6 +50,11 @@ def _isAllowed(key: str, value: Any) -> bool:
   return isinstance(value, rule)
 
 
+def filterAllowed(values: dict[str, Any]) -> dict[str, Any]:
+  """既定値として保存できる項目だけを取り出す."""
+  return {key: value for key, value in values.items() if _isAllowed(key, value)}
+
+
 def load() -> dict[str, Any]:
   """保存された既定値を読み込む．壊れている項目は無視する."""
   path = settingsPath()
@@ -79,7 +84,7 @@ def load() -> dict[str, Any]:
     return {}
 
   # 想定外の項目や型が入っていても，そこだけ捨てて残りは活かす
-  return {key: value for key, value in data.items() if _isAllowed(key, value)}
+  return filterAllowed(data)
 
 
 def save(values: dict[str, Any]) -> None:
@@ -93,7 +98,9 @@ def save(values: dict[str, Any]) -> None:
       f"設定ディレクトリを作成できません: {path.parent}（{error}）"
     ) from error
 
-  payload = {key: value for key, value in sorted(values.items()) if _isAllowed(key, value)}
+  payload = {
+    key: value for key, value in sorted(filterAllowed(values).items())
+  }
 
   temporaryPath: str | None = None
   try:

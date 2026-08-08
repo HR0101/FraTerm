@@ -33,6 +33,8 @@ SUBCOMMANDS = {
   "play": (),
   "run": (),
   "cache": (),
+  "export": (),
+  "import": (),
   "defaults": ("config",),
   "menu": ("help",),
 }
@@ -186,6 +188,9 @@ MIN_SPEED = 0.25
 MAX_SPEED = 4.0
 SPEED_STEP = 0.25
 
+# 再生中の左右キーで移動する秒数
+SEEK_STEP_SECONDS = 10.0
+
 # 音量（ffplay へ渡す0〜100の値）
 DEFAULT_VOLUME = 100
 MIN_VOLUME = 0
@@ -193,13 +198,18 @@ MAX_VOLUME = 100
 VOLUME_STEP = 10
 
 # ffplay が実際に音を出し始めるまでの遅延（実測で0.25〜0.55秒）．
-# この分だけ先の位置から再生させることで，映像との頭出しを合わせる
-AUDIO_START_LATENCY = 0.35
+# 映像の先行を避けるため，測定範囲の上限を既定値にする．環境差による
+# 残りのずれは --audio-offset で調整できる（正の値で音声が先行）．
+AUDIO_START_LATENCY = 0.55
 
 # 音声と映像のずれを補正する秒数．正の値で音声が先行する
 DEFAULT_AUDIO_OFFSET = 0.0
 MIN_AUDIO_OFFSET = -5.0
 MAX_AUDIO_OFFSET = 5.0
+
+# URLの読み込みは一時的に失敗することがあるため，数回試す
+REMOTE_OPEN_ATTEMPTS = 3
+REMOTE_OPEN_RETRY_DELAY = 1.0
 
 # 一時停止中にキー入力を待つ間隔（秒）
 PAUSED_POLL_INTERVAL = 0.05
