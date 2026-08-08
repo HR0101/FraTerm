@@ -91,6 +91,17 @@ def test_detectLetterboxReturnsActiveImageBounds():
   assert renderer.detectLetterbox(frame) == (15, 85)
 
 
+def test_detectBlackBordersReturnsAllSides():
+  """上下左右すべての黒帯を検出できることを確認する."""
+  frame = np.full((100, 200, 3), 180, dtype=np.uint8)
+  frame[:10] = 0
+  frame[-10:] = 0
+  frame[:, :20] = 0
+  frame[:, -20:] = 0
+
+  assert renderer.detectBlackBorders(frame) == (10, 90, 20, 180)
+
+
 def test_detectLetterboxToleratesSubtitleInBlackBar():
   """黒帯内の字幕のような明るい画素を許容することを確認する."""
   frame = np.full((100, 200, 3), 180, dtype=np.uint8)

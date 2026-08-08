@@ -71,48 +71,57 @@ def supportsTrueColor() -> bool:
   return termProgram in {"iterm.app", "wezterm", "vscode", "ghostty", "hyper"}
 
 
-def detectLetterbox(frame: np.ndarray) -> tuple[int, int]:
-  """上下の黒帯を検出し，映像領域の上下端（下端は排他的）を返す.
+def _detectBorderAxis(values: np.ndarray) -> tuple[int, int]:
+  """1次元の明るさ列から，両端の黒帯を検出する."""
+  size = len(values)
+  darkValues = values <= LETTERBOX_BLACK_LEVEL
+  minimumSize = max(2, round(size * LETTERBOX_MIN_FRACTION))
 
-  全体が暗い映像や短い暗転を黒帯と誤認しないよう，黒い行の連続長と
-  残った中央領域の明るさを同時に確認する．検出できない場合は全領域を返す.
+  start = 0
+  while start < size and darkValues[start]:
+    start += 1
+  end = size
+  while end > start and darkValues[end - 1]:
+    end -= 1
+
+  start = start if start >= minimumSize else 0
+  end = end if size - end >= minimumSize else size
+  if end - start < size * LETTERBOX_MIN_CONTENT_FRACTION:
+    return 0, size
+  return start, end
+
+
+def detectBlackBorders(frame: np.ndarray) -> tuple[int, int, int, int]:
+  """1フレームの上下左右の黒帯を検出する.
+
+  戻り値は ``(top, bottom, left, right)`` で，下端・右端は排他的．全体が暗い
+  映像や短い暗転を誤認しないよう，残った中央領域にも明るさのある画素が必要．
   """
-  if frame.ndim not in (2, 3) or frame.shape[0] < 8 or frame.shape[1] < 8:
-    return 0, frame.shape[0]
+  frameHeight, frameWidth = frame.shape[:2]
+  if frame.ndim not in (2, 3) or frameHeight < 8 or frameWidth < 8:
+    return 0, frameHeight, 0, frameWidth
 
-  frameHeight = frame.shape[0]
   if frame.ndim == 3:
     grayFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
   else:
     grayFrame = frame
 
-  # 行の境界を正確に保つため，検出は縮小せず元の横幅で行う．
-  # この処理は動画ごとに最初の1フレームだけなので，表示中の負荷は増えない．
-  graySample = grayFrame
-  sampleHeight = frameHeight
+  # 字幕など少数の明るい画素が黒帯にあっても検出できるよう，行・列の中央値を見る．
+  rowBrightness = np.percentile(grayFrame, LETTERBOX_DARK_PERCENTILE, axis=1)
+  columnBrightness = np.percentile(grayFrame, LETTERBOX_DARK_PERCENTILE, axis=0)
+  top, bottom = _detectBorderAxis(rowBrightness)
+  left, right = _detectBorderAxis(columnBrightness)
 
-  # 字幕など少数の明るい画素が黒帯にあっても検出できるよう，行の中央値を見る．
-  rowBrightness = np.percentile(graySample, LETTERBOX_DARK_PERCENTILE, axis=1)
-  darkRows = rowBrightness <= LETTERBOX_BLACK_LEVEL
-  minimumRows = max(2, round(sampleHeight * LETTERBOX_MIN_FRACTION))
-
-  top = 0
-  while top < sampleHeight and darkRows[top]:
-    top += 1
-  bottom = sampleHeight
-  while bottom > top and darkRows[bottom - 1]:
-    bottom -= 1
-
-  top = top if top >= minimumRows else 0
-  bottom = bottom if sampleHeight - bottom >= minimumRows else sampleHeight
-  contentHeight = bottom - top
-  if contentHeight < sampleHeight * LETTERBOX_MIN_CONTENT_FRACTION:
-    return 0, frameHeight
-
-  contentSample = graySample[top:bottom]
+  contentSample = grayFrame[top:bottom, left:right]
   if np.percentile(contentSample, 95) <= LETTERBOX_BLACK_LEVEL + 16:
-    return 0, frameHeight
+    return 0, frameHeight, 0, frameWidth
 
+  return top, bottom, left, right
+
+
+def detectLetterbox(frame: np.ndarray) -> tuple[int, int]:
+  """上下の黒帯を検出し，映像領域の上下端を返す（互換用）."""
+  top, bottom, _, _ = detectBlackBorders(frame)
   return top, bottom
 
 
