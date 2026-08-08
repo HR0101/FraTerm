@@ -48,7 +48,6 @@ PLAYBACK_ATTRIBUTES = (
   "color",
   "volume",
   "audioOffset",
-  "audioEffect",
   "showStatus",
 )
 
@@ -332,14 +331,6 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
     help="音声のずれを補正する秒数（正の値で音声を先行させる）",
   )
   parser.add_argument(
-    "-e",
-    "--audio-effect",
-    dest="audioEffect",
-    choices=config.AUDIO_EFFECT_CHOICES,
-    default=UNSET,
-    help=f"音声の加工（既定: {config.DEFAULT_AUDIO_EFFECT}．8bit でレトロゲーム風）",
-  )
-  parser.add_argument(
     "-c",
     "--color",
     choices=config.COLOR_CHOICES,
@@ -595,7 +586,6 @@ def handleAdd(args: argparse.Namespace) -> int:
     color=valueOr(args.color, config.DEFAULT_COLOR),
     volume=valueOr(args.volume, config.DEFAULT_VOLUME),
     audioOffset=valueOr(args.audioOffset, config.DEFAULT_AUDIO_OFFSET),
-    audioEffect=valueOr(args.audioEffect, config.DEFAULT_AUDIO_EFFECT),
     quality=valueOr(args.quality, None),
     cache=valueOr(args.cache, False),
     cookiesFromBrowser=valueOr(args.cookiesFromBrowser, None),
@@ -663,7 +653,6 @@ def handleShow(args: argparse.Namespace) -> int:
     ("コントラスト", f"{entry.contrast:g}"),
     ("文字の着色", entry.color),
     ("音量", f"{entry.volume}%"),
-    ("音声の加工", entry.audioEffect),
   ]
 
   if entry.isRemote:
