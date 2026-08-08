@@ -58,6 +58,16 @@ class VideoEntry:
   charset: str | None = None
   brightness: float = config.DEFAULT_BRIGHTNESS
   contrast: float = config.DEFAULT_CONTRAST
+  # 以下はURLを登録した場合にのみ使用する
+  quality: str | None = None
+  cache: bool = False
+  # ログインが必要な動画向けのCookie設定
+  cookiesFromBrowser: str | None = None
+  cookiesFile: str | None = None
+  # YouTubeの取得方法（プレイヤークライアント）の指定
+  playerClient: str | None = None
+  # ダウンロード済みファイルの場所（再生時に自動で記録する）
+  cachedPath: str | None = None
 
   def toDict(self) -> dict[str, Any]:
     """JSONへ保存する形式の辞書を返す（登録名はキーになるため含めない）."""
@@ -70,6 +80,12 @@ class VideoEntry:
       "charset": self.charset,
       "brightness": self.brightness,
       "contrast": self.contrast,
+      "quality": self.quality,
+      "cache": self.cache,
+      "cookiesFromBrowser": self.cookiesFromBrowser,
+      "cookiesFile": self.cookiesFile,
+      "playerClient": self.playerClient,
+      "cachedPath": self.cachedPath,
     }
 
   @classmethod
@@ -102,14 +118,36 @@ class VideoEntry:
       charset=data.get("charset") if isinstance(data.get("charset"), str) else None,
       brightness=_floatOrDefault(data.get("brightness"), config.DEFAULT_BRIGHTNESS),
       contrast=_floatOrDefault(data.get("contrast"), config.DEFAULT_CONTRAST),
+      quality=data.get("quality") if isinstance(data.get("quality"), str) else None,
+      cache=bool(data.get("cache", False)),
+      cookiesFromBrowser=_optionalText(data.get("cookiesFromBrowser")),
+      cookiesFile=_optionalText(data.get("cookiesFile")),
+      playerClient=_optionalText(data.get("playerClient")),
+      cachedPath=(
+        data.get("cachedPath") if isinstance(data.get("cachedPath"), str) else None
+      ),
     )
+
+  def cachedFile(self) -> Path | None:
+    """ダウンロード済みファイルが残っていれば，そのパスを返す."""
+    if not self.cachedPath:
+      return None
+    cachedFilePath = Path(self.cachedPath)
+    return cachedFilePath if cachedFilePath.is_file() else None
 
   def resolvedCharset(self) -> str:
     """プリセット名を解決した実際の文字セットを返す."""
     return config.resolveCharset(self.charset)
 
+  @property
+  def isRemote(self) -> bool:
+    """登録内容がURLかどうかを返す."""
+    return config.isUrl(self.path)
+
   def videoExists(self) -> bool:
-    """登録された動画ファイルが現在も存在するかどうかを返す."""
+    """再生できる状態かどうかを返す．URLは再生時まで確認しない."""
+    if self.isRemote:
+      return True
     return Path(self.path).is_file()
 
 
@@ -131,6 +169,11 @@ def _optionalFloat(value: Any) -> float | None:
     return float(value)
   except (TypeError, ValueError):
     return None
+
+
+def _optionalText(value: Any) -> str | None:
+  """文字列であればそのまま，そうでなければ None を返す."""
+  return value if isinstance(value, str) and value else None
 
 
 def _floatOrDefault(value: Any, default: float) -> float:
@@ -280,7 +323,7 @@ class Registry:
     if name not in entries:
       raise NameNotFoundError(
         f"「{name}」は登録されていません．",
-        hint=f"登録一覧は `{config.APP_NAME} list` で確認できます．",
+        hint=f"登録一覧は `{config.commandName()} list` で確認できます．",
       )
     return entries[name]
 
@@ -305,7 +348,7 @@ class Registry:
     if name not in entries:
       raise NameNotFoundError(
         f"「{name}」は登録されていません．",
-        hint=f"登録一覧は `{config.APP_NAME} list` で確認できます．",
+        hint=f"登録一覧は `{config.commandName()} list` で確認できます．",
       )
 
     updatedEntry = replace(entries[name], **changes)
@@ -319,7 +362,7 @@ class Registry:
     if name not in entries:
       raise NameNotFoundError(
         f"「{name}」は登録されていません．",
-        hint=f"登録一覧は `{config.APP_NAME} list` で確認できます．",
+        hint=f"登録一覧は `{config.commandName()} list` で確認できます．",
       )
 
     removedEntry = entries.pop(name)
