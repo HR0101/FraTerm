@@ -119,7 +119,7 @@ def test_audioRequiresFfplay(dummyVideo, monkeypatch):
     Player(dummyVideo, options, stream=io.StringIO()).play()
 
 
-@pytest.mark.parametrize("mode", [config.MODE_ASCII, config.MODE_COLOR, config.MODE_MONO])
+@pytest.mark.parametrize("mode", config.AVAILABLE_MODES)
 def test_playSampleVideoToStream(sampleVideo, mode):
   """実際の動画を最後まで再生し，出力と後始末を確認する."""
   stream = io.StringIO()

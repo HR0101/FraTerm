@@ -48,6 +48,8 @@ class PlaybackOptions:
   contrast: float = config.DEFAULT_CONTRAST
   showStatus: bool = True
   title: str = ""
+  # 動画から長さを取得できない場合（URL再生など）に使用する再生時間
+  duration: float | None = None
 
   @classmethod
   def fromEntry(cls, entry: VideoEntry) -> "PlaybackOptions":
@@ -115,8 +117,8 @@ class Player:
     """動画を最後まで（または利用者が終了するまで）再生する."""
     import cv2  # 起動を軽くするため，再生時にのみ読み込む
 
-    videoFile = Path(self.videoPath)
-    if not videoFile.is_file():
+    # URLはこの時点では存在確認できないため，ファイルのときだけ確認する
+    if not config.isUrl(self.videoPath) and not Path(self.videoPath).is_file():
       raise VideoFileError(
         f"動画ファイルが見つかりません: {self.videoPath}",
         hint="ファイルが移動または削除されていないか確認してください．",
@@ -137,6 +139,9 @@ class Player:
     self._capture = capture
     self._videoFps = self._readFps(capture, cv2)
     self._duration = self._readDuration(capture, cv2)
+    if self._duration <= 0 and self.options.duration:
+      # ストリーミング再生ではフレーム数を取得できないため，取得済みの情報を使う
+      self._duration = float(self.options.duration)
 
     try:
       self._prepareTerminal()
@@ -426,7 +431,7 @@ class Player:
       self.options.mode,
       columns,
       rows,
-      config.resolveCharset(self.options.charset),
+      self.options.charset,
       self.options.brightness,
       self.options.contrast,
     )
