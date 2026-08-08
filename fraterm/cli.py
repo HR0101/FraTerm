@@ -6,10 +6,12 @@ import argparse
 import sys
 from typing import Any, Sequence
 
-from . import config, source
+from dataclasses import replace
+
+from . import config, settings, source
 from .errors import FraTermError, VideoFileError
-from .registry import Registry, VideoEntry, resolveVideoPath
-from .textwidth import displayWidth, padToWidth
+from .registry import Registry, VideoEntry, resolveVideoPath, validateName
+from .textwidth import charWidth, displayWidth, padToWidth, sanitizeText
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -31,23 +33,8 @@ UNSET = _Unset()
 # 「自動・既定に戻す」を意味する入力値
 AUTO_KEYWORDS = frozenset({"auto", "none", "default", "-"})
 
-# 登録名として解釈せず，サブコマンドとして扱う語
-KNOWN_COMMANDS = frozenset(
-  {
-    "add",
-    "remove",
-    "rm",
-    "delete",
-    "list",
-    "ls",
-    "show",
-    "info",
-    "edit",
-    "play",
-    "run",
-    "cache",
-  }
-)
+# 登録名として解釈せず，サブコマンドとして扱う語（定義は config が一元管理する）
+KNOWN_COMMANDS = config.COMMAND_NAMES
 
 # 再生時に上書きできる描画・再生の設定
 PLAYBACK_ATTRIBUTES = (
@@ -58,6 +45,10 @@ PLAYBACK_ATTRIBUTES = (
   "charset",
   "brightness",
   "contrast",
+  "color",
+  "volume",
+  "audioOffset",
+  "audioEffect",
   "showStatus",
 )
 
@@ -102,11 +93,18 @@ def buildEpilog() -> str:
 URLから再生する（yt-dlp が必要です）:
   {name} run "https://www.youtube.com/watch?v=XXXXXXXXXXX" --mode color
   {name} add opening "https://www.youtube.com/watch?v=XXXXXXXXXXX" --quality 480
-  {name} run "<URL>" --cookies-from-browser chrome   # 年齢制限などの動画
+  {name} run "<URL>" -b chrome                       # 年齢制限などの動画
   {name} cache --clear
 
+毎回のオプションを減らす:
+  {name} defaults -m ascii -s detailed -c true -b chrome   # 既定値を保存する
+  {name} run "<URL>"                                       # 以降は指定不要
+
+短縮形: -m モード / -s 文字セット / -c 着色 / -w 幅 / -a 音声 / -q 画質 / -b ブラウザ
+
 再生中の操作:
-  q: 終了 / space: 一時停止・再開 / r: 先頭から / m: ミュート / +,-: 再生速度
+  q: 終了 / space: 一時停止・再開 / r: 先頭から / m: ミュート
+  +,-: 再生速度 / 9,0: 音量 / s: 保存
 
 URLは引用符で囲んでください（zshでは `?` がエラーになります）．
 """
@@ -173,6 +171,32 @@ def contrastValue(rawValue: str) -> float:
   return number
 
 
+def volumeValue(rawValue: str) -> int:
+  """音量の指定を検証する."""
+  try:
+    number = int(rawValue)
+  except ValueError as error:
+    raise argparse.ArgumentTypeError(f"整数を指定してください: {rawValue}") from error
+  if not config.MIN_VOLUME <= number <= config.MAX_VOLUME:
+    raise argparse.ArgumentTypeError(
+      f"{config.MIN_VOLUME}〜{config.MAX_VOLUME} の範囲で指定してください．"
+    )
+  return number
+
+
+def audioOffsetValue(rawValue: str) -> float:
+  """音声のずれ補正値を検証する."""
+  try:
+    number = float(rawValue)
+  except ValueError as error:
+    raise argparse.ArgumentTypeError(f"数値を指定してください: {rawValue}") from error
+  if not config.MIN_AUDIO_OFFSET <= number <= config.MAX_AUDIO_OFFSET:
+    raise argparse.ArgumentTypeError(
+      f"{config.MIN_AUDIO_OFFSET}〜{config.MAX_AUDIO_OFFSET} の範囲で指定してください．"
+    )
+  return number
+
+
 def optionalText(rawValue: str) -> str | None:
   """文字列，または既定へ戻すことを意味する None へ変換する."""
   if rawValue.lower() in AUTO_KEYWORDS:
@@ -207,6 +231,18 @@ def charsetValue(rawValue: str) -> str | None:
     raise argparse.ArgumentTypeError(
       "文字セットは2文字以上必要です（暗い順に並べてください）．"
     )
+
+  # 1文字が1列に収まらないと，描画した行の幅がずれて表示が崩れる
+  wideCharacters = [
+    character for character in rawValue if charWidth(character) != 1
+  ]
+  if wideCharacters:
+    raise argparse.ArgumentTypeError(
+      f"表示幅が1でない文字は使用できません: {''.join(wideCharacters)}"
+    )
+  if any(not character.isprintable() and character != " " for character in rawValue):
+    raise argparse.ArgumentTypeError("制御文字は文字セットに使用できません．")
+
   return rawValue
 
 
@@ -220,12 +256,14 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
   presetNames = "，".join(config.CHARSET_PRESETS)
 
   parser.add_argument(
+    "-m",
     "--mode",
     choices=config.AVAILABLE_MODES,
     default=UNSET,
     help=f"描画モード（既定: {config.DEFAULT_MODE}）",
   )
   parser.add_argument(
+    "-a",
     "--audio",
     dest="audio",
     action="store_const",
@@ -241,6 +279,7 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
     help="音声を再生しない",
   )
   parser.add_argument(
+    "-w",
     "--width",
     type=optionalPositiveInt,
     default=UNSET,
@@ -255,6 +294,7 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
     help="描画FPSの上限（auto で動画のFPSに従う）",
   )
   parser.add_argument(
+    "-s",
     "--charset",
     type=charsetValue,
     default=UNSET,
@@ -277,6 +317,40 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
   )
 
   parser.add_argument(
+    "--volume",
+    type=volumeValue,
+    default=UNSET,
+    metavar="値",
+    help=f"音量（{config.MIN_VOLUME}〜{config.MAX_VOLUME}，既定: {config.DEFAULT_VOLUME}）",
+  )
+  parser.add_argument(
+    "--audio-offset",
+    dest="audioOffset",
+    type=audioOffsetValue,
+    default=UNSET,
+    metavar="秒",
+    help="音声のずれを補正する秒数（正の値で音声を先行させる）",
+  )
+  parser.add_argument(
+    "-e",
+    "--audio-effect",
+    dest="audioEffect",
+    choices=config.AUDIO_EFFECT_CHOICES,
+    default=UNSET,
+    help=f"音声の加工（既定: {config.DEFAULT_AUDIO_EFFECT}．8bit でレトロゲーム風）",
+  )
+  parser.add_argument(
+    "-c",
+    "--color",
+    choices=config.COLOR_CHOICES,
+    default=UNSET,
+    help=(
+      "文字自体に色を付ける（ascii・edgeモード用．"
+      f"既定: {config.DEFAULT_COLOR}．256色端末なら 256，対応端末なら true）"
+    ),
+  )
+  parser.add_argument(
+    "-q",
     "--quality",
     choices=config.QUALITY_CHOICES,
     default=UNSET,
@@ -298,6 +372,7 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
     help="URL再生時に，ダウンロードせず直接再生する",
   )
   parser.add_argument(
+    "-b",
     "--cookies-from-browser",
     dest="cookiesFromBrowser",
     type=cookieBrowserValue,
@@ -435,6 +510,32 @@ def buildParser() -> argparse.ArgumentParser:
   )
   cacheParser.set_defaults(handler=handleCache)
 
+  # defaults ------------------------------------------------------------------
+  defaultsParser = subparsers.add_parser(
+    "defaults",
+    aliases=["config"],
+    help="毎回指定するオプションの既定値を設定する",
+    description=(
+      "よく使うオプションを既定値として保存します．"
+      "保存した内容は run と add に自動で適用され，"
+      "コマンドで明示した指定が常に優先されます．"
+    ),
+  )
+  addPlaybackArguments(defaultsParser, includeStatus=False)
+  defaultsParser.add_argument(
+    "--clear", action="store_true", help="保存した既定値をすべて削除する"
+  )
+  defaultsParser.set_defaults(handler=handleDefaults)
+
+  # menu ----------------------------------------------------------------------
+  menuParser = subparsers.add_parser(
+    "menu",
+    aliases=["help"],
+    help="使い方と設定を全画面で表示する",
+    description="使い方・キー操作・既定の設定・環境の状態を1画面で確認できます．",
+  )
+  menuParser.set_defaults(handler=handleMenu)
+
   return parser
 
 
@@ -479,6 +580,8 @@ def storablePath(rawPath: str) -> str:
 
 def handleAdd(args: argparse.Namespace) -> int:
   """動画ファイルまたはURLを登録する."""
+  applyDefaults(args)
+
   entry = VideoEntry(
     name=args.name,
     path=storablePath(args.path),
@@ -489,6 +592,10 @@ def handleAdd(args: argparse.Namespace) -> int:
     charset=valueOr(args.charset, None),
     brightness=valueOr(args.brightness, config.DEFAULT_BRIGHTNESS),
     contrast=valueOr(args.contrast, config.DEFAULT_CONTRAST),
+    color=valueOr(args.color, config.DEFAULT_COLOR),
+    volume=valueOr(args.volume, config.DEFAULT_VOLUME),
+    audioOffset=valueOr(args.audioOffset, config.DEFAULT_AUDIO_OFFSET),
+    audioEffect=valueOr(args.audioEffect, config.DEFAULT_AUDIO_EFFECT),
     quality=valueOr(args.quality, None),
     cache=valueOr(args.cache, False),
     cookiesFromBrowser=valueOr(args.cookiesFromBrowser, None),
@@ -520,7 +627,7 @@ def handleList(args: argparse.Namespace) -> int:
       "yes" if entry.audio else "no",
       "auto" if entry.width is None else str(entry.width),
       "auto" if entry.fps is None else f"{entry.fps:g}",
-      entry.path,
+      sanitizeText(entry.path),
     )
     for _, entry in sorted(entries.items())
   ]
@@ -546,7 +653,7 @@ def handleShow(args: argparse.Namespace) -> int:
 
   items = [
     ("登録名", entry.name),
-    ("URL" if entry.isRemote else "動画ファイル", entry.path),
+    ("URL" if entry.isRemote else "動画ファイル", sanitizeText(entry.path)),
     ("描画モード", entry.mode),
     ("音声", "再生する" if entry.audio else "再生しない"),
     ("最大表示幅", "auto" if entry.width is None else f"{entry.width} 桁"),
@@ -554,6 +661,9 @@ def handleShow(args: argparse.Namespace) -> int:
     ("文字セット", charsetLabel),
     ("明るさ", f"{entry.brightness:g}"),
     ("コントラスト", f"{entry.contrast:g}"),
+    ("文字の着色", entry.color),
+    ("音量", f"{entry.volume}%"),
+    ("音声の加工", entry.audioEffect),
   ]
 
   if entry.isRemote:
@@ -624,11 +734,13 @@ def handlePlay(args: argparse.Namespace) -> int:
   options = playerModule.PlaybackOptions.fromEntry(entry)
   options.duration = playable.duration
   applyOverrides(options, args)
+  options.onSave = buildSaveHandler(entry.path, options, args)
   return startPlayback(playerModule, playable.path, options)
 
 
 def handleRun(args: argparse.Namespace) -> int:
   """登録せずに動画ファイルやURLを再生する."""
+  applyDefaults(args)
   playerModule = importPlayerModule()
 
   quality, useCache, cookies = sourceSettings(args)
@@ -638,7 +750,122 @@ def handleRun(args: argparse.Namespace) -> int:
     title=playable.title, duration=playable.duration
   )
   applyOverrides(options, args)
+  # 元の指定（URLまたはファイルパス）を保存対象にする
+  options.onSave = buildSaveHandler(args.path, options, args)
   return startPlayback(playerModule, playable.path, options)
+
+
+def buildSaveHandler(originalPath: str, options: Any, args: argparse.Namespace):
+  """再生中の保存操作（sキー）で呼ばれる処理を組み立てる."""
+  quality, _, cookies = sourceSettings(args)
+
+  def saveAs(name: str) -> str:
+    """入力された名前で手元へ保存し，登録する."""
+    try:
+      validateName(name)
+    except FraTermError as error:
+      return f"{error.message}"
+
+    registry = Registry()
+    if name in registry.load():
+      return f"「{name}」はすでに登録されています．別の名前を指定してください．"
+
+    entry = VideoEntry(
+      name=name,
+      path=originalPath if config.isUrl(originalPath) else resolveVideoPath(originalPath),
+      mode=options.mode,
+      audio=options.audio,
+      width=options.width,
+      fps=options.fps,
+      charset=options.charset,
+      brightness=options.brightness,
+      contrast=options.contrast,
+      color=options.color,
+      volume=options.volume,
+      audioOffset=options.audioOffset,
+      quality=quality,
+      cache=config.isUrl(originalPath),
+      cookiesFromBrowser=cookies.fromBrowser,
+      cookiesFile=cookies.filePath,
+      playerClient=cookies.playerClient,
+    )
+
+    if entry.isRemote:
+      # ネットが無くても再生できるよう，実体をダウンロードしておく
+      metadata = source.fetchMetadata(originalPath, quality, cookies)
+      cachedFile = source.downloadToCache(
+        originalPath,
+        quality,
+        source.cachePathFor(metadata, originalPath, quality),
+        None,
+        cookies,
+      )
+      entry = replace(
+        entry, cachedPath=str(cachedFile), cachedQuality=effectiveQuality(quality)
+      )
+
+    registry.add(entry)
+
+    playCommand = f"{config.commandName()} {name}"
+    if entry.isRemote:
+      return f"「{name}」を保存しました．オフラインでも `{playCommand}` で再生できます．"
+    return f"「{name}」を登録しました．`{playCommand}` で再生できます．"
+
+  return saveAs
+
+
+def handleMenu(args: argparse.Namespace) -> int:
+  """使い方と設定のメニューを表示する."""
+  from .menu import Menu
+
+  Menu().run()
+  return EXIT_OK
+
+
+def handleDefaults(args: argparse.Namespace) -> int:
+  """オプションの既定値を表示・設定・削除する."""
+  if args.clear:
+    settings.clear()
+    print("既定値を削除しました．")
+    return EXIT_OK
+
+  changes = collectChanges(args)
+  if changes:
+    values = settings.update(changes)
+    print("既定値を保存しました．")
+  else:
+    values = settings.load()
+
+  print(f"保存先: {settings.settingsPath()}")
+  if not values:
+    print("既定値は設定されていません．")
+    print(
+      f"例: {config.commandName()} defaults -m ascii -s detailed -c true -b chrome"
+    )
+    return EXIT_OK
+
+  labelWidth = max(displayWidth(key) for key in values)
+  for key, value in sorted(values.items()):
+    print(f"  {padToWidth(key, labelWidth)} : {formatSettingValue(value)}")
+  print(f"削除するには `{config.commandName()} defaults --clear` を実行してください．")
+  return EXIT_OK
+
+
+def formatSettingValue(value: Any) -> str:
+  """既定値の表示用に整える."""
+  if value is None:
+    return "auto"
+  if isinstance(value, bool):
+    return "はい" if value else "いいえ"
+  return str(value)
+
+
+def applyDefaults(args: argparse.Namespace) -> None:
+  """指定されなかったオプションを，保存済みの既定値で補う."""
+  storedDefaults = settings.load()
+  for attribute, value in storedDefaults.items():
+    if isinstance(getattr(args, attribute, UNSET), _Unset):
+      setattr(args, attribute, value)
 
 
 def handleCache(args: argparse.Namespace) -> int:
@@ -684,10 +911,12 @@ def resolvePlaybackSource(entry: VideoEntry, args: argparse.Namespace):
 
   if entry.isRemote and useCache:
     cachedFile = entry.cachedFile()
-    if cachedFile is not None:
+    if cachedFile is not None and matchesCachedQuality(entry, quality):
       # ダウンロード済みなら，ネットワークに接続せずそのまま再生する
       notifyProgress(f"ダウンロード済みの動画を再生します: {cachedFile}")
       return source.PlayableSource(path=str(cachedFile), title=entry.name)
+    if cachedFile is not None:
+      notifyProgress("画質の指定が変わったため，取得し直します．")
 
   # URLの直リンクは時間で失効するため，再生のたびに解決し直す
   playable = source.openSource(
@@ -695,10 +924,26 @@ def resolvePlaybackSource(entry: VideoEntry, args: argparse.Namespace):
   )
 
   if entry.isRemote and useCache and not playable.isRemote:
-    # 次回以降に再利用できるよう，保存先を登録内容へ記録する
-    Registry().update(entry.name, {"cachedPath": playable.path})
+    # 次回以降に再利用できるよう，保存先と画質を登録内容へ記録する
+    Registry().update(
+      entry.name,
+      {"cachedPath": playable.path, "cachedQuality": effectiveQuality(quality)},
+    )
 
   return playable
+
+
+def effectiveQuality(quality: str | None) -> str:
+  """未指定の画質を既定値へそろえる."""
+  return quality or config.DEFAULT_QUALITY
+
+
+def matchesCachedQuality(entry: VideoEntry, quality: str | None) -> bool:
+  """ダウンロード済みファイルが，今回の画質指定と一致するかを返す."""
+  if entry.cachedQuality is None:
+    # 画質を記録していない古い登録は，そのまま再利用する
+    return True
+  return entry.cachedQuality == effectiveQuality(quality)
 
 
 def sourceSettings(
