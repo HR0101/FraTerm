@@ -38,6 +38,9 @@ TERMINATION_SIGNALS = ("SIGTERM", "SIGHUP")
 # 再生中に表示する操作説明
 KEY_HELP = "[q/Esc]終了 [space]一時停止 [←/→]移動 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [s]保存"
 
+# エラー表示でURLを短く見せるときの幅
+MAX_SOURCE_LABEL_WIDTH = 60
+
 # 保存名として受け付ける最大文字数
 MAX_INPUT_LENGTH = 40
 
@@ -210,12 +213,7 @@ class Player:
       audioModule.ensureAvailable()
       self._audioPlayer = audioModule.AudioPlayer(self.videoPath)
 
-    capture = cv2.VideoCapture(self.videoPath)
-    if not capture.isOpened():
-      raise PlaybackError(
-        f"動画ファイルを読み込めません: {self.videoPath}",
-        hint="対応していない形式か，ファイルが壊れている可能性があります．",
-      )
+    capture = self._openCapture(cv2)
 
     self._capture = capture
     self._letterboxBounds = None
@@ -256,6 +254,61 @@ class Player:
         self._capture = None
       self._restoreTerminal()
       self._restoreSignalHandlers()
+
+  # -------------------------------------------------------------------------
+  # 動画を開く
+  # -------------------------------------------------------------------------
+
+  def _sourceLabel(self) -> str:
+    """エラー表示に使う，短くて分かりやすい入力名を返す."""
+    if not config.isUrl(self.videoPath):
+      return self.videoPath
+    if self.options.title:
+      return self.options.title
+    return truncateToWidth(self.videoPath, MAX_SOURCE_LABEL_WIDTH) + "…"
+
+  @staticmethod
+  def _quietOpenCvLogging(cv2Module) -> None:
+    """OpenCVの警告表示を抑える．失敗の理由は自前のメッセージで伝える."""
+    try:
+      logging = cv2Module.utils.logging
+      logging.setLogLevel(logging.LOG_LEVEL_ERROR)
+    except AttributeError:
+      # 対応していない版では何もしない
+      pass
+
+  def _openCapture(self, cv2Module):
+    """動画を開く．URLは一時的に失敗することがあるため何度か試す."""
+    self._quietOpenCvLogging(cv2Module)
+    isRemote = config.isUrl(self.videoPath)
+
+    # URLで自動選択に任せると，開けなかったときに連番画像として解釈し直し，
+    # 本当の原因が分からないエラーになる．FFmpegを明示して防ぐ
+    backend = cv2Module.CAP_FFMPEG if isRemote else cv2Module.CAP_ANY
+    attempts = config.REMOTE_OPEN_ATTEMPTS if isRemote else 1
+
+    for attempt in range(1, attempts + 1):
+      capture = cv2Module.VideoCapture(self.videoPath, backend)
+      if capture.isOpened():
+        return capture
+
+      capture.release()
+      if attempt < attempts:
+        print(
+          f"読み込めなかったため再試行します（{attempt}/{attempts - 1}）．",
+          file=sys.stderr,
+        )
+        time.sleep(config.REMOTE_OPEN_RETRY_DELAY)
+
+    raise PlaybackError(
+      f"動画を読み込めません: {self._sourceLabel()}",
+      hint=(
+        "通信が不安定な可能性があります．"
+        "`--cache` を付けると，ダウンロードしてから再生するので安定します．"
+        if isRemote
+        else "対応していない形式か，ファイルが壊れている可能性があります．"
+      ),
+    )
 
   # -------------------------------------------------------------------------
   # 終了シグナルの処理

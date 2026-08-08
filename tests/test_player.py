@@ -170,8 +170,132 @@ def test_seekKeysUseTenSecondStep(dummyVideo):
   player._seekBy = lambda seconds: moved.append(seconds)
 
   assert player._handleKey(KEY_LEFT) is True
+  assert player._handleKey(KEY_RIGHT) is True
+  assert player._handleKey("h") is True
   assert player._handleKey("l") is True
-  assert moved == [-config.SEEK_STEP_SECONDS, config.SEEK_STEP_SECONDS]
+  assert moved == [
+    -config.SEEK_STEP_SECONDS,
+    config.SEEK_STEP_SECONDS,
+    -config.SEEK_STEP_SECONDS,
+    config.SEEK_STEP_SECONDS,
+  ]
+
+
+class FakeCapture:
+  """OpenCV の VideoCapture を模したテスト用のクラス."""
+
+  def __init__(self, opened: bool) -> None:
+    self._opened = opened
+    self.released = False
+
+  def isOpened(self) -> bool:
+    return self._opened
+
+  def release(self) -> None:
+    self.released = True
+
+
+class FakeCv2:
+  """指定回数だけ読み込みに失敗する OpenCV の代役."""
+
+  CAP_ANY = 0
+  CAP_FFMPEG = 1900
+
+  def __init__(self, failures: int = 0) -> None:
+    self.failures = failures
+    self.calls: list[tuple[str, int]] = []
+    self.captures: list[FakeCapture] = []
+
+  def VideoCapture(self, path, backend):  # noqa: N802 OpenCV の名前に合わせる
+    self.calls.append((path, backend))
+    capture = FakeCapture(len(self.calls) > self.failures)
+    self.captures.append(capture)
+    return capture
+
+
+def test_urlUsesFfmpegBackend(monkeypatch):
+  """URLではFFmpegを明示して開くことを確認する."""
+  monkeypatch.setattr(config, "REMOTE_OPEN_RETRY_DELAY", 0)
+  player = Player("https://example.invalid/video.mp4", stream=io.StringIO())
+  fakeCv2 = FakeCv2()
+
+  player._openCapture(fakeCv2)
+  assert fakeCv2.calls == [("https://example.invalid/video.mp4", FakeCv2.CAP_FFMPEG)]
+
+
+def test_localFileUsesDefaultBackend(dummyVideo):
+  """ローカルファイルでは従来どおり自動選択で開くことを確認する."""
+  player = Player(dummyVideo, stream=io.StringIO())
+  fakeCv2 = FakeCv2()
+
+  player._openCapture(fakeCv2)
+  assert fakeCv2.calls[0][1] == FakeCv2.CAP_ANY
+  assert len(fakeCv2.calls) == 1  # ファイルは再試行しない
+
+
+def test_urlIsRetriedOnTemporaryFailure(monkeypatch, capsys):
+  """URLの一時的な失敗を再試行で乗り越えられることを確認する."""
+  monkeypatch.setattr(config, "REMOTE_OPEN_RETRY_DELAY", 0)
+  player = Player("https://example.invalid/video.mp4", stream=io.StringIO())
+  fakeCv2 = FakeCv2(failures=1)  # 1回目だけ失敗する
+
+  capture = player._openCapture(fakeCv2)
+  assert capture.isOpened() is True
+  assert len(fakeCv2.calls) == 2
+  assert "再試行" in capsys.readouterr().err
+
+
+def test_urlFailureSuggestsCacheOption(monkeypatch):
+  """URLを開けない場合に --cache を案内することを確認する."""
+  monkeypatch.setattr(config, "REMOTE_OPEN_RETRY_DELAY", 0)
+  player = Player("https://example.invalid/video.mp4", stream=io.StringIO())
+  fakeCv2 = FakeCv2(failures=99)
+
+  with pytest.raises(PlaybackError) as errorInfo:
+    player._openCapture(fakeCv2)
+
+  assert "--cache" in (errorInfo.value.hint or "")
+  assert len(fakeCv2.calls) == config.REMOTE_OPEN_ATTEMPTS
+  # 開けなかった分は後始末されている
+  assert all(capture.released for capture in fakeCv2.captures)
+
+
+def test_localFailureKeepsFormatHint(dummyVideo):
+  """ローカルファイルの失敗では，従来どおり形式の案内を出すことを確認する."""
+  player = Player(dummyVideo, stream=io.StringIO())
+  fakeCv2 = FakeCv2(failures=99)
+
+  with pytest.raises(PlaybackError) as errorInfo:
+    player._openCapture(fakeCv2)
+
+  assert "--cache" not in (errorInfo.value.hint or "")
+  assert "対応していない形式" in (errorInfo.value.hint or "")
+
+
+def test_longUrlIsShortenedInErrorMessage(monkeypatch):
+  """長いURLがエラー表示で切り詰められることを確認する."""
+  monkeypatch.setattr(config, "REMOTE_OPEN_RETRY_DELAY", 0)
+  longUrl = "https://example.invalid/videoplayback?" + "a=1&" * 200
+  player = Player(longUrl, stream=io.StringIO())
+
+  with pytest.raises(PlaybackError) as errorInfo:
+    player._openCapture(FakeCv2(failures=99))
+
+  assert len(errorInfo.value.message) < 200
+  assert len(longUrl) > 400
+
+
+def test_titleIsUsedInErrorMessageWhenAvailable(monkeypatch):
+  """タイトルが分かっている場合は，URLではなくタイトルで知らせることを確認する."""
+  monkeypatch.setattr(config, "REMOTE_OPEN_RETRY_DELAY", 0)
+  options = PlaybackOptions(title="テスト動画")
+  player = Player("https://example.invalid/a?b=1", options, stream=io.StringIO())
+
+  with pytest.raises(PlaybackError) as errorInfo:
+    player._openCapture(FakeCv2(failures=99))
+
+  assert "テスト動画" in errorInfo.value.message
+  assert "example.invalid" not in errorInfo.value.message
 
 
 def test_missingVideoRaises(tmp_path):
@@ -269,22 +393,33 @@ def makeAudioPlayer(dummyVideo, **optionValues):
   return player, fakeAudio
 
 
+def test_audioLatencyUsesConservativeUpperBound():
+  """映像が先行しないよう，実測遅延の上限を既定値にしていることを確認する."""
+  assert config.AUDIO_START_LATENCY >= 0.55
+
+
 def test_audioStartsAtLatencyCompensatedPosition(dummyVideo):
   """ffplayの起動遅延を見込んだ位置から音声を開始することを確認する."""
   player, fakeAudio = makeAudioPlayer(dummyVideo)
+  player._mediaTime = lambda: 0.0
   player._syncAudio()
 
   assert len(fakeAudio.starts) == 1
   # 現在位置よりも起動遅延の分だけ先を指定している
-  assert fakeAudio.starts[0]["position"] >= config.AUDIO_START_LATENCY
+  assert fakeAudio.starts[0]["position"] == pytest.approx(
+    config.AUDIO_START_LATENCY
+  )
 
 
 def test_audioOffsetShiftsStartPosition(dummyVideo):
   """--audio-offset の指定が開始位置へ反映されることを確認する."""
   player, fakeAudio = makeAudioPlayer(dummyVideo, audioOffset=1.5)
+  player._mediaTime = lambda: 0.0
   player._syncAudio()
 
-  assert fakeAudio.starts[0]["position"] >= config.AUDIO_START_LATENCY + 1.5
+  assert fakeAudio.starts[0]["position"] == pytest.approx(
+    config.AUDIO_START_LATENCY + 1.5
+  )
 
 
 def test_volumeKeysChangeVolume(dummyVideo):
