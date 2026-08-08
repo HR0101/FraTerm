@@ -24,7 +24,6 @@ ALLOWED_KEYS: dict[str, Any] = {
   "color": config.COLOR_CHOICES,
   "volume": (int,),
   "audioOffset": (float, int),
-  "audioEffect": config.AUDIO_EFFECT_CHOICES,
   "quality": config.QUALITY_CHOICES,
   "cache": bool,
   "cookiesFromBrowser": (str, type(None)),

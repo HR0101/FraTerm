@@ -45,7 +45,6 @@ class VideoEntry:
   color: str = config.DEFAULT_COLOR
   volume: int = config.DEFAULT_VOLUME
   audioOffset: float = config.DEFAULT_AUDIO_OFFSET
-  audioEffect: str = config.DEFAULT_AUDIO_EFFECT
   # 以下はURLを登録した場合にのみ使用する
   quality: str | None = None
   cache: bool = False
@@ -72,7 +71,6 @@ class VideoEntry:
       "color": self.color,
       "volume": self.volume,
       "audioOffset": self.audioOffset,
-      "audioEffect": self.audioEffect,
       "quality": self.quality,
       "cache": self.cache,
       "cookiesFromBrowser": self.cookiesFromBrowser,
@@ -121,11 +119,6 @@ class VideoEntry:
         data.get("volume"), config.DEFAULT_VOLUME, config.MIN_VOLUME, config.MAX_VOLUME
       ),
       audioOffset=_floatOrDefault(data.get("audioOffset"), config.DEFAULT_AUDIO_OFFSET),
-      audioEffect=(
-        data.get("audioEffect")
-        if data.get("audioEffect") in config.AUDIO_EFFECT_CHOICES
-        else config.DEFAULT_AUDIO_EFFECT
-      ),
       quality=data.get("quality") if isinstance(data.get("quality"), str) else None,
       cache=bool(data.get("cache", False)),
       cookiesFromBrowser=_optionalText(data.get("cookiesFromBrowser")),
