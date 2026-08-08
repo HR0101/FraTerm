@@ -100,6 +100,43 @@ def test_renderAsciiBrightnessRaisesValues():
   assert charset.index(brightOutput[0]) > charset.index(baseOutput[0])
 
 
+def test_renderAsciiFallbackMatchesSelectedRenderer(monkeypatch):
+  """ASCIIのPythonフォールバックが選択中の実装と同じ結果を返すことを確認する."""
+  frame = np.arange(12 * 16 * 3, dtype=np.uint8).reshape(12, 16, 3)
+  expected = renderer.renderAscii(
+    frame, 7, 3, config.CHARSET_PRESETS["blocks"], 0.2, 1.4
+  )
+
+  monkeypatch.setattr(renderer, "_native", None)
+  assert renderer.renderAscii(
+    frame, 7, 3, config.CHARSET_PRESETS["blocks"], 0.2, 1.4
+  ) == expected
+
+
+@pytest.mark.skipif(
+  renderer._native is None, reason="任意のC拡張がビルドされていません"
+)
+@pytest.mark.parametrize(
+  "charset",
+  [config.DEFAULT_CHARSET, config.CHARSET_PRESETS["blocks"], "#", " 🌑🌕"],
+)
+def test_nativeAsciiMatchesPythonFallback(charset):
+  """ASCIIのC拡張とPython実装がUnicodeを含め同じ結果を返すことを確認する."""
+  grayFrame = np.arange(9 * 13, dtype=np.uint8).reshape(9, 13)[:, ::-1]
+  assert renderer._native.renderAscii(grayFrame, charset) == (
+    renderer._renderAsciiPython(grayFrame, charset)
+  )
+
+
+@pytest.mark.skipif(
+  renderer._native is None, reason="任意のC拡張がビルドされていません"
+)
+def test_nativeAsciiRejectsInvalidFrameShape():
+  """ASCIIのC拡張がカラー配列を安全に拒否することを確認する."""
+  with pytest.raises(ValueError):
+    renderer._native.renderAscii(np.zeros((4, 4, 3), dtype=np.uint8), " .")
+
+
 def test_renderHalfBlockUsesBlockCharacters():
   """カラー描画がハーフブロック文字とANSIコードを含むことを確認する."""
   frame = makeFrame(32, 32, 200)
@@ -154,6 +191,18 @@ def test_nativeRendererMatchesPythonFallback(grayscale):
 @pytest.mark.skipif(
   renderer._native is None, reason="任意のC拡張がビルドされていません"
 )
+def test_nativeRendererAcceptsGrayscaleFrame():
+  """モノクロ用の2次元画像をC拡張が直接描画できることを確認する."""
+  grayFrame = np.arange(12 * 10, dtype=np.uint8).reshape(12, 10)
+  colorFrame = np.repeat(grayFrame[:, :, None], 3, axis=2)
+  assert renderer._native.renderHalfBlock(grayFrame) == (
+    renderer._renderHalfBlockPython(colorFrame)
+  )
+
+
+@pytest.mark.skipif(
+  renderer._native is None, reason="任意のC拡張がビルドされていません"
+)
 def test_nativeRendererAcceptsNonContiguousFrame():
   """C拡張が負のstrideを持つ画像も正しく読み取ることを確認する."""
   frame = np.arange(12 * 10 * 3, dtype=np.uint8).reshape(12, 10, 3)
@@ -169,7 +218,7 @@ def test_nativeRendererAcceptsNonContiguousFrame():
 def test_nativeRendererRejectsInvalidFrameShape():
   """C拡張が不正な配列を安全に拒否することを確認する."""
   with pytest.raises(ValueError):
-    renderer._native.renderHalfBlock(np.zeros((4, 4), dtype=np.uint8))
+    renderer._native.renderHalfBlock(np.zeros((4, 4, 4), dtype=np.uint8))
 
 
 def test_renderMonoProducesGrayColors():
