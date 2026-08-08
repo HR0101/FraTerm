@@ -18,6 +18,7 @@ ALLOWED_KEYS: dict[str, Any] = {
   "audio": bool,
   "width": (int, type(None)),
   "fps": (float, int, type(None)),
+  "preRender": bool,
   "charset": (str, type(None)),
   "brightness": (float, int),
   "contrast": (float, int),

@@ -101,6 +101,14 @@ def test_defaultsApplyToRun(dummyVideo, recordedPlayers):
   assert options.width == 70
 
 
+def test_preRenderDefaultAppliesToRun(dummyVideo, recordedPlayers):
+  """事前生成の既定値が run の再生設定へ反映されることを確認する."""
+  cli.main(["defaults", "--pre-render"])
+
+  assert cli.main(["run", str(dummyVideo)]) == cli.EXIT_OK
+  assert recordedPlayers[0].options.preRender is True
+
+
 def test_commandLineOverridesDefaults(dummyVideo, recordedPlayers):
   """コマンドで指定した値が既定値より優先されることを確認する."""
   cli.main(["defaults", "-m", "edge", "-c", "256"])

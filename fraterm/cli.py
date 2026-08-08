@@ -10,7 +10,14 @@ from dataclasses import replace
 
 from . import config, settings, source
 from .errors import FraTermError, VideoFileError
-from .registry import Registry, VideoEntry, resolveVideoPath, validateName
+from .errors import NameNotFoundError
+from .registry import (
+  Registry,
+  VideoEntry,
+  resolveVideoPath,
+  similarNames,
+  validateName,
+)
 from .textwidth import charWidth, displayWidth, padToWidth, sanitizeText
 
 EXIT_OK = 0
@@ -42,6 +49,7 @@ PLAYBACK_ATTRIBUTES = (
   "audio",
   "width",
   "fps",
+  "preRender",
   "charset",
   "brightness",
   "contrast",
@@ -293,6 +301,21 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
     help="描画FPSの上限（auto で動画のFPSに従う）",
   )
   parser.add_argument(
+    "--pre-render",
+    dest="preRender",
+    action="store_const",
+    const=True,
+    default=UNSET,
+    help="再生前に全フレームを生成し，再生中の変換遅延をなくす",
+  )
+  parser.add_argument(
+    "--no-pre-render",
+    dest="preRender",
+    action="store_const",
+    const=False,
+    help="事前生成を無効にする",
+  )
+  parser.add_argument(
     "-s",
     "--charset",
     type=charsetValue,
@@ -454,7 +477,12 @@ def buildParser() -> argparse.ArgumentParser:
 
   # edit --------------------------------------------------------------------
   editParser = subparsers.add_parser(
-    "edit", help="登録内容を変更する", description="登録済みの設定を変更します．"
+    "edit",
+    help="登録内容を変更する（オプション無しで編集画面が開きます）",
+    description=(
+      "登録済みの設定を変更します．"
+      "オプションを指定しない場合は，項目を選んで直せる画面が開きます．"
+    ),
   )
   editParser.add_argument("name", help="登録名")
   addPlaybackArguments(editParser, includeStatus=False)
@@ -580,6 +608,7 @@ def handleAdd(args: argparse.Namespace) -> int:
     audio=valueOr(args.audio, False),
     width=valueOr(args.width, None),
     fps=valueOr(args.fps, None),
+    preRender=valueOr(args.preRender, False),
     charset=valueOr(args.charset, None),
     brightness=valueOr(args.brightness, config.DEFAULT_BRIGHTNESS),
     contrast=valueOr(args.contrast, config.DEFAULT_CONTRAST),
@@ -648,6 +677,7 @@ def handleShow(args: argparse.Namespace) -> int:
     ("音声", "再生する" if entry.audio else "再生しない"),
     ("最大表示幅", "auto" if entry.width is None else f"{entry.width} 桁"),
     ("FPS上限", "auto" if entry.fps is None else f"{entry.fps:g}"),
+    ("事前生成", "有効" if entry.preRender else "無効"),
     ("文字セット", charsetLabel),
     ("明るさ", f"{entry.brightness:g}"),
     ("コントラスト", f"{entry.contrast:g}"),
@@ -685,11 +715,14 @@ def handleEdit(args: argparse.Namespace) -> int:
   """登録内容を変更する."""
   changes = collectChanges(args)
   if not changes:
-    raise FraTermError(
-      "変更する項目が指定されていません．",
-      hint=f"例: {config.commandName()} edit {args.name} --mode color --audio",
-    )
+    # 指定が無い場合は，項目を選んで直せる画面を開く
+    from .editor import editEntry
 
+    getEntryWithSuggestions(args.name)
+    editEntry(args.name)
+    return EXIT_OK
+
+  getEntryWithSuggestions(args.name)
   entry = Registry().update(args.name, changes)
   print(f"「{entry.name}」の設定を変更しました．")
   for key, value in changes.items():
@@ -704,11 +737,26 @@ def handleRemove(args: argparse.Namespace) -> int:
   return EXIT_OK
 
 
+def getEntryWithSuggestions(name: str):
+  """登録内容を取得する．見つからない場合はコマンド名の候補も案内する."""
+  try:
+    return Registry().get(name)
+  except NameNotFoundError as error:
+    commandSuggestions = similarNames(name, sorted(config.COMMAND_NAMES))
+    if commandSuggestions:
+      commandName = config.commandName()
+      error.hint = (
+        f"コマンド名の打ち間違いかもしれません: `{commandName} {commandSuggestions[0]}`\n"
+        f"{error.hint or ''}"
+      )
+    raise
+
+
 def handlePlay(args: argparse.Namespace) -> int:
   """登録した動画を再生する."""
   playerModule = importPlayerModule()
 
-  entry = Registry().get(args.name)
+  entry = getEntryWithSuggestions(args.name)
   if not entry.videoExists():
     raise VideoFileError(
       f"「{entry.name}」の動画ファイルが見つかりません: {entry.path}",
@@ -766,6 +814,7 @@ def buildSaveHandler(originalPath: str, options: Any, args: argparse.Namespace):
       audio=options.audio,
       width=options.width,
       fps=options.fps,
+      preRender=options.preRender,
       charset=options.charset,
       brightness=options.brightness,
       contrast=options.contrast,
@@ -1001,6 +1050,28 @@ def startPlayback(playerModule, videoPath: str, options: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
+def printWelcome() -> None:
+  """引数なしで実行されたときに，最初の一歩を案内する."""
+  name = config.commandName()
+  print(f"FraTerm {config.VERSION} — 動画をターミナルで再生します．")
+  print()
+  print("はじめての方は，まず次のどちらかをお試しください．")
+  print(f"  {name} menu                使い方・設定・動作環境を1画面で確認する")
+  print(f"  {name} run <動画ファイル>   とりあえず再生してみる")
+
+  try:
+    names = Registry().names()
+  except FraTermError:
+    names = []
+
+  if names:
+    preview = "，".join(names[:3]) + ("…" if len(names) > 3 else "")
+    print()
+    print(f"登録済み（{len(names)}件）: {preview}")
+    print(f"  {name} <登録名>            登録した動画を再生する")
+  print()
+
+
 def printError(error: FraTermError) -> None:
   """エラー内容と対処方法を標準エラー出力へ表示する."""
   print(f"エラー: {error.message}", file=sys.stderr)
@@ -1014,6 +1085,7 @@ def main(argv: Sequence[str] | None = None) -> int:
   parser = buildParser()
 
   if not rawArgs:
+    printWelcome()
     parser.print_help()
     return EXIT_OK
 
