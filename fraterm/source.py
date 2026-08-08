@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -19,8 +20,25 @@ from .registry import resolveVideoPath
 
 YTDLP_COMMAND = "yt-dlp"
 
+# キャッシュ名を組み立てる際の上限と既定値
+MAX_ID_LENGTH = 48
+MAX_EXTENSION_LENGTH = 8
+DEFAULT_EXTENSION = "mp4"
+URL_DIGEST_LENGTH = 10
+
+# ダウンロード途中のファイルに付ける拡張子
+PARTIAL_SUFFIX = ".part"
+
+# これより小さいファイルは失敗した残骸とみなす
+MIN_CACHE_FILE_SIZE = 1024
+
+# YouTubeの署名解読に使えるJavaScriptランタイム（yt-dlp の優先順）
+# yt-dlp は既定で deno しか有効にしないため，導入済みのものを明示的に有効化する
+JS_RUNTIMES = ("deno", "node", "quickjs", "bun")
+
 # yt-dlp の実行を打ち切るまでの秒数
-METADATA_TIMEOUT = 60
+# Cookieの読み出しや署名解読に時間がかかるため，余裕を持たせる
+METADATA_TIMEOUT = 180
 DOWNLOAD_TIMEOUT = 1800
 
 # エラー表示に使用する yt-dlp の出力行数
@@ -61,6 +79,17 @@ YTDLP_ERROR_HINTS = (
   ("unable to download webpage", "接続できません．ネットワーク状態を確認してください．"),
   ("could not copy", "ブラウザのCookieを読み出せません．ブラウザを終了してから再実行してください．"),
   ("unsupported browser", "対応していないブラウザ名です．"),
+  (
+    "signature solving failed",
+    "YouTubeの署名解読にJavaScriptランタイムが必要です．"
+    "`brew install deno`（または Node.js 22以上）を導入してください．",
+  ),
+  (
+    "only images are available",
+    "映像の形式を取得できませんでした．"
+    "`brew install deno`（または Node.js 22以上）と `python -m pip install yt-dlp-ejs` "
+    "を導入すると解決することがあります．",
+  ),
 )
 
 # 上記に当てはまらない場合の一般的な対処方法
@@ -145,6 +174,19 @@ def ytdlpCommand() -> list[str]:
     "URLの再生に必要な yt-dlp が見つかりません．",
     hint="`python -m pip install yt-dlp` を実行してください．",
   )
+
+
+def jsRuntimeArguments() -> list[str]:
+  """導入済みのJavaScriptランタイムを yt-dlp へ有効化させる引数を組み立てる.
+
+  YouTubeは署名の解読にJavaScriptの実行を必要とするが，yt-dlp が既定で有効に
+  するのは deno だけである．node などが入っていれば併せて有効化する.
+  """
+  arguments: list[str] = []
+  for runtimeName in JS_RUNTIMES:
+    if shutil.which(runtimeName) is not None:
+      arguments.extend(["--js-runtimes", runtimeName])
+  return arguments
 
 
 def formatSelector(quality: str | None) -> str:
@@ -242,6 +284,7 @@ def fetchMetadata(
       "--no-playlist",
       "--no-progress",
       "--no-warnings",
+      *jsRuntimeArguments(),
       "-f",
       formatSelector(quality),
       *cookieArguments,
@@ -277,13 +320,58 @@ def extractStreamUrl(metadata: dict[str, Any]) -> str:
   return str(streamUrl)
 
 
-def cachePathFor(metadata: dict[str, Any]) -> Path:
-  """動画情報から，キャッシュファイルの保存先を組み立てる."""
-  videoId = str(metadata.get("id") or "video")
-  extension = str(metadata.get("ext") or "mp4")
-  # ファイル名に使えない文字を除去する
-  safeId = "".join(char for char in videoId if char.isalnum() or char in "-_")
-  return config.cacheDir() / f"{safeId}.{extension}"
+def _sanitizeIdentifier(value: str, fallback: str, maxLength: int) -> str:
+  """ファイル名の一部として安全に使える文字列へ変換する."""
+  safeValue = "".join(
+    character for character in value if character.isalnum() or character in "-_"
+  )
+  return safeValue[:maxLength] if safeValue else fallback
+
+
+def _sanitizeExtension(value: str) -> str:
+  """拡張子として安全な英数字のみを残す."""
+  safeValue = "".join(character for character in value if character.isalnum())
+  return safeValue[:MAX_EXTENSION_LENGTH].lower() if safeValue else DEFAULT_EXTENSION
+
+
+def cacheKeyFor(metadata: dict[str, Any], url: str, quality: str | None) -> str:
+  """URL・画質・動画IDから，衝突しないキャッシュ名を組み立てる."""
+  extractor = _sanitizeIdentifier(
+    str(metadata.get("extractor_key") or metadata.get("extractor") or "site"),
+    "site",
+    MAX_ID_LENGTH,
+  )
+  videoId = _sanitizeIdentifier(str(metadata.get("id") or ""), "video", MAX_ID_LENGTH)
+  qualityLabel = _sanitizeIdentifier(
+    str(quality or config.DEFAULT_QUALITY), "auto", MAX_ID_LENGTH
+  )
+  # 同じ動画IDでもURLが異なる場合に取り違えないよう，URLの要約を付ける
+  urlDigest = hashlib.sha1(url.strip().encode("utf-8")).hexdigest()[:URL_DIGEST_LENGTH]
+  return f"{extractor}-{videoId}-{qualityLabel}-{urlDigest}"
+
+
+def cachePathFor(
+  metadata: dict[str, Any], url: str = "", quality: str | None = None
+) -> Path:
+  """動画情報から，キャッシュファイルの保存先を組み立てる.
+
+  外部から渡される値をそのまま連結すると，キャッシュディレクトリの外へ
+  書き出せてしまうため，構成要素を無害化したうえで保存先を検証する.
+  """
+  extension = _sanitizeExtension(str(metadata.get("ext") or ""))
+  cacheDirectory = config.cacheDir()
+  candidate = cacheDirectory / f"{cacheKeyFor(metadata, url, quality)}.{extension}"
+
+  # 念のため，解決後もキャッシュディレクトリ配下であることを確認する
+  resolvedDirectory = cacheDirectory.expanduser().resolve()
+  resolvedCandidate = candidate.expanduser().resolve()
+  if resolvedDirectory not in resolvedCandidate.parents:
+    raise SourceError(
+      "キャッシュの保存先を決められません．",
+      hint=f"保存先は {cacheDirectory} の中である必要があります．",
+    )
+
+  return candidate
 
 
 def downloadToCache(
@@ -294,10 +382,13 @@ def downloadToCache(
   cookies: AccessOptions | None = None,
 ) -> Path:
   """動画をキャッシュディレクトリへ保存する．既にあれば再利用する."""
-  if targetPath.is_file() and targetPath.stat().st_size > 0:
+  if isUsableCache(targetPath):
     if notify is not None:
       notify(f"キャッシュを使用します: {targetPath}")
     return targetPath
+
+  # 前回の失敗で残った中途半端なファイルは作り直す
+  removeQuietly(targetPath)
 
   try:
     targetPath.parent.mkdir(parents=True, exist_ok=True)
@@ -309,25 +400,62 @@ def downloadToCache(
   if notify is not None:
     notify("動画をダウンロードしています．しばらくお待ちください．")
 
-  cookieArguments = cookies.toArguments() if cookies is not None else []
-  runYtdlp(
-    [
-      "--no-playlist",
-      "--no-progress",
-      "--no-warnings",
-      "-f",
-      formatSelector(quality),
-      *cookieArguments,
-      "-o",
-      str(targetPath),
-      url,
-    ],
-    DOWNLOAD_TIMEOUT,
-  )
+  # 途中で失敗したファイルを完成品と取り違えないよう，別名で受け取る
+  partialPath = targetPath.with_name(targetPath.name + PARTIAL_SUFFIX)
+  removeQuietly(partialPath)
 
-  if not targetPath.is_file():
-    raise SourceError(f"ダウンロードしたファイルが見つかりません: {targetPath}")
+  cookieArguments = cookies.toArguments() if cookies is not None else []
+  try:
+    runYtdlp(
+      [
+        "--no-playlist",
+        "--no-progress",
+        "--no-warnings",
+        *jsRuntimeArguments(),
+        "-f",
+        formatSelector(quality),
+        *cookieArguments,
+        "-o",
+        str(partialPath),
+        url,
+      ],
+      DOWNLOAD_TIMEOUT,
+    )
+  except SourceError:
+    removeQuietly(partialPath)
+    raise
+
+  if not isUsableCache(partialPath):
+    fileSize = partialPath.stat().st_size if partialPath.is_file() else 0
+    removeQuietly(partialPath)
+    raise SourceError(
+      f"ダウンロードした動画が不完全です（{fileSize}バイト）．",
+      hint="通信状況を確認して，もう一度お試しください．",
+    )
+
+  try:
+    os.replace(partialPath, targetPath)
+  except OSError as error:
+    removeQuietly(partialPath)
+    raise SourceError(f"キャッシュを保存できません: {targetPath}（{error}）") from error
+
   return targetPath
+
+
+def isUsableCache(path: Path) -> bool:
+  """キャッシュとして再利用できるファイルかどうかを判定する."""
+  try:
+    return path.is_file() and path.stat().st_size >= MIN_CACHE_FILE_SIZE
+  except OSError:
+    return False
+
+
+def removeQuietly(path: Path) -> None:
+  """ファイルが残っていれば削除する（失敗しても無視する）."""
+  try:
+    path.unlink(missing_ok=True)
+  except OSError:
+    pass
 
 
 def resolveUrl(
@@ -351,7 +479,11 @@ def resolveUrl(
 
   if useCache:
     cachedFile = downloadToCache(
-      normalizedUrl, quality, cachePathFor(metadata), notify, cookieOptions
+      normalizedUrl,
+      quality,
+      cachePathFor(metadata, normalizedUrl, quality),
+      notify,
+      cookieOptions,
     )
     return PlayableSource(
       path=str(cachedFile), title=title, duration=durationSeconds, isRemote=False
