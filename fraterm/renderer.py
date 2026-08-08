@@ -45,13 +45,6 @@ GRAYSCALE_TOLERANCE = 12
 # True Color対応と判断するCOLORTERMの値
 TRUE_COLOR_HINTS = ("truecolor", "24bit")
 
-# レターボックス検出の設定．黒い映像そのものを誤って切らないよう，
-# 画面端の大部分が暗い行だけを対象にし，中央の映像領域も確認する．
-LETTERBOX_BLACK_LEVEL = 24
-LETTERBOX_DARK_PERCENTILE = 50
-LETTERBOX_MIN_FRACTION = 0.02
-LETTERBOX_MIN_CONTENT_FRACTION = 0.4
-
 # インストール時にC拡張をビルドできたかを診断やベンチマークで確認できるようにする
 HAS_NATIVE_RENDERER = _native is not None
 
@@ -69,60 +62,6 @@ def supportsTrueColor() -> bool:
   # iTerm2 や Apple Terminal など，COLORTERM を設定しない環境向けの判定
   termProgram = os.environ.get("TERM_PROGRAM", "").lower()
   return termProgram in {"iterm.app", "wezterm", "vscode", "ghostty", "hyper"}
-
-
-def _detectBorderAxis(values: np.ndarray) -> tuple[int, int]:
-  """1次元の明るさ列から，両端の黒帯を検出する."""
-  size = len(values)
-  darkValues = values <= LETTERBOX_BLACK_LEVEL
-  minimumSize = max(2, round(size * LETTERBOX_MIN_FRACTION))
-
-  start = 0
-  while start < size and darkValues[start]:
-    start += 1
-  end = size
-  while end > start and darkValues[end - 1]:
-    end -= 1
-
-  start = start if start >= minimumSize else 0
-  end = end if size - end >= minimumSize else size
-  if end - start < size * LETTERBOX_MIN_CONTENT_FRACTION:
-    return 0, size
-  return start, end
-
-
-def detectBlackBorders(frame: np.ndarray) -> tuple[int, int, int, int]:
-  """1フレームの上下左右の黒帯を検出する.
-
-  戻り値は ``(top, bottom, left, right)`` で，下端・右端は排他的．全体が暗い
-  映像や短い暗転を誤認しないよう，残った中央領域にも明るさのある画素が必要．
-  """
-  frameHeight, frameWidth = frame.shape[:2]
-  if frame.ndim not in (2, 3) or frameHeight < 8 or frameWidth < 8:
-    return 0, frameHeight, 0, frameWidth
-
-  if frame.ndim == 3:
-    grayFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-  else:
-    grayFrame = frame
-
-  # 字幕など少数の明るい画素が黒帯にあっても検出できるよう，行・列の中央値を見る．
-  rowBrightness = np.percentile(grayFrame, LETTERBOX_DARK_PERCENTILE, axis=1)
-  columnBrightness = np.percentile(grayFrame, LETTERBOX_DARK_PERCENTILE, axis=0)
-  top, bottom = _detectBorderAxis(rowBrightness)
-  left, right = _detectBorderAxis(columnBrightness)
-
-  contentSample = grayFrame[top:bottom, left:right]
-  if np.percentile(contentSample, 95) <= LETTERBOX_BLACK_LEVEL + 16:
-    return 0, frameHeight, 0, frameWidth
-
-  return top, bottom, left, right
-
-
-def detectLetterbox(frame: np.ndarray) -> tuple[int, int]:
-  """上下の黒帯を検出し，映像領域の上下端を返す（互換用）."""
-  top, bottom, _, _ = detectBlackBorders(frame)
-  return top, bottom
 
 
 def computeSize(
