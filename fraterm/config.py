@@ -13,19 +13,65 @@ from pathlib import Path
 APP_NAME = "fraterm"
 VERSION = "0.1.0"
 
+# 短く打てるようにする別名
+SHORT_COMMAND_NAME = "ft"
+
+# 実行時のコマンド名として認める値
+COMMAND_ALIASES = (APP_NAME, SHORT_COMMAND_NAME)
+
 # 設定ディレクトリを明示的に差し替えるための環境変数（テストや持ち運び用）
 HOME_ENV_VAR = "FRATERM_HOME"
 
 REGISTRY_FILE_NAME = "videos.json"
+
+# ダウンロードした動画を保存するディレクトリ名
+CACHE_DIR_NAME = "cache"
+
+# ---------------------------------------------------------------------------
+# URL再生（yt-dlp）
+# ---------------------------------------------------------------------------
+
+# 端末表示ではそれほど高い解像度を必要としないため，既定は480pとする
+DEFAULT_QUALITY = "480"
+QUALITY_CHOICES = ("360", "480", "720", "1080", "best", "worst")
+
+# URLとして扱うスキーム
+URL_SCHEMES = ("http://", "https://")
+
+# yt-dlp がCookieを読み出せるブラウザ
+SUPPORTED_COOKIE_BROWSERS = (
+  "brave",
+  "chrome",
+  "chromium",
+  "edge",
+  "firefox",
+  "opera",
+  "safari",
+  "vivaldi",
+  "whale",
+)
+
+# Cookieの指定を毎回書かずに済ませるための環境変数
+COOKIES_BROWSER_ENV_VAR = "FRATERM_COOKIES_FROM_BROWSER"
+COOKIES_FILE_ENV_VAR = "FRATERM_COOKIES"
+
+# YouTubeの取得方法（プレイヤークライアント）としてよく使う値
+COMMON_PLAYER_CLIENTS = ("mweb", "tv", "web", "web_safari", "tv_embedded", "ios")
+
+
+def isUrl(text: str) -> bool:
+  """文字列がURLかどうかを判定する."""
+  return text.strip().lower().startswith(URL_SCHEMES)
 
 # ---------------------------------------------------------------------------
 # 描画モード
 # ---------------------------------------------------------------------------
 
 MODE_ASCII = "ascii"
+MODE_EDGE = "edge"
 MODE_COLOR = "color"
 MODE_MONO = "mono"
-AVAILABLE_MODES = (MODE_ASCII, MODE_COLOR, MODE_MONO)
+AVAILABLE_MODES = (MODE_ASCII, MODE_EDGE, MODE_COLOR, MODE_MONO)
 DEFAULT_MODE = MODE_ASCII
 
 # 上下2画素を1文字で表現するモード（ハーフブロック文字を使用する）
@@ -44,6 +90,25 @@ CHARSET_PRESETS = {
 }
 DEFAULT_CHARSET_NAME = "standard"
 DEFAULT_CHARSET = CHARSET_PRESETS[DEFAULT_CHARSET_NAME]
+
+# 輪郭モードでは線が目立つよう，塗りつぶしに薄い文字セットを使う
+DEFAULT_EDGE_CHARSET = " .:"
+
+# ---------------------------------------------------------------------------
+# 輪郭検出（edgeモード）
+# ---------------------------------------------------------------------------
+
+# 1文字あたり何画素で線の向きを判定するか
+EDGE_SAMPLE_FACTOR = 3
+
+# 上位何パーセントの勾配を線として扱うか（フレームごとに自動調整する）
+EDGE_PERCENTILE = 80.0
+
+# 平坦な映像でノイズを線として拾わないための下限値
+EDGE_MIN_THRESHOLD = 70.0
+
+# セル内で線と判定された画素がこの割合を超えたら，そのセルを線として描く
+EDGE_MIN_RATIO = 0.4
 
 # ---------------------------------------------------------------------------
 # 描画パラメータ
@@ -87,6 +152,13 @@ MAX_SLEEP_INTERVAL = 0.1
 # ---------------------------------------------------------------------------
 
 
+def commandName() -> str:
+  """実際に打たれたコマンド名を返す．別名で起動した場合はその名前を使う."""
+  invokedName = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else ""
+  # 想定外の実行方法（python -m など）では正式名称を使う
+  return invokedName if invokedName in COMMAND_ALIASES else APP_NAME
+
+
 def configDir() -> Path:
   """OSごとに適切な設定ディレクトリのパスを返す."""
   overridePath = os.environ.get(HOME_ENV_VAR)
@@ -111,6 +183,11 @@ def registryPath() -> Path:
   return configDir() / REGISTRY_FILE_NAME
 
 
+def cacheDir() -> Path:
+  """ダウンロードした動画を保存するディレクトリのパスを返す."""
+  return configDir() / CACHE_DIR_NAME
+
+
 def resolveCharset(value: str | None) -> str:
   """プリセット名または文字列そのものを，実際に使用する文字セットへ変換する."""
   if value is None:
@@ -118,3 +195,10 @@ def resolveCharset(value: str | None) -> str:
   if value in CHARSET_PRESETS:
     return CHARSET_PRESETS[value]
   return value
+
+
+def charsetFor(mode: str, value: str | None) -> str:
+  """描画モードに応じた既定値を考慮して，使用する文字セットを決める."""
+  if value is None and mode == MODE_EDGE:
+    return DEFAULT_EDGE_CHARSET
+  return resolveCharset(value)

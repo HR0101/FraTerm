@@ -36,6 +36,10 @@ class VideoFileError(FraTermError):
   """動画ファイルが存在しない，または読み込めない場合のエラー."""
 
 
+class SourceError(FraTermError):
+  """URLの解決やダウンロードに失敗した場合のエラー."""
+
+
 class PlaybackError(FraTermError):
   """再生処理そのものに失敗した場合のエラー."""
 

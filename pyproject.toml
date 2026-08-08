@@ -25,10 +25,12 @@ classifiers = [
 dependencies = ["opencv-python>=4.8", "numpy>=1.24"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+youtube = ["yt-dlp>=2024.1.1"]
+dev = ["pytest>=7.4", "yt-dlp>=2024.1.1"]
 
 [project.scripts]
 fraterm = "fraterm.cli:main"
+ft = "fraterm.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/HR0101/FraTerm"
