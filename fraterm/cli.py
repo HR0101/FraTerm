@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 from typing import Any, Sequence
 
-from . import config
+from . import config, source
 from .errors import FraTermError, VideoFileError
 from .registry import Registry, VideoEntry, resolveVideoPath
 from .textwidth import displayWidth, padToWidth
@@ -34,11 +33,24 @@ AUTO_KEYWORDS = frozenset({"auto", "none", "default", "-"})
 
 # 登録名として解釈せず，サブコマンドとして扱う語
 KNOWN_COMMANDS = frozenset(
-  {"add", "remove", "rm", "delete", "list", "ls", "show", "info", "edit", "play", "run"}
+  {
+    "add",
+    "remove",
+    "rm",
+    "delete",
+    "list",
+    "ls",
+    "show",
+    "info",
+    "edit",
+    "play",
+    "run",
+    "cache",
+  }
 )
 
-# 再生設定として上書きできる項目
-OVERRIDABLE_ATTRIBUTES = (
+# 再生時に上書きできる描画・再生の設定
+PLAYBACK_ATTRIBUTES = (
   "mode",
   "audio",
   "width",
@@ -49,6 +61,24 @@ OVERRIDABLE_ATTRIBUTES = (
   "showStatus",
 )
 
+# URLを解決する際に使用する設定
+SOURCE_ATTRIBUTES = (
+  "quality",
+  "cache",
+  "cookiesFromBrowser",
+  "cookiesFile",
+  "playerClient",
+)
+
+# 登録情報として保存する設定（ステータス行の表示は保存しない）
+STORED_ATTRIBUTES = tuple(
+  attribute for attribute in PLAYBACK_ATTRIBUTES if attribute != "showStatus"
+) + SOURCE_ATTRIBUTES
+
+# キャッシュ容量の表示に使う単位
+BYTE_UNITS = ("B", "KB", "MB", "GB", "TB")
+BYTES_PER_UNIT = 1024.0
+
 # 明るさの指定範囲
 MIN_BRIGHTNESS = -1.0
 MAX_BRIGHTNESS = 1.0
@@ -57,17 +87,28 @@ MAX_BRIGHTNESS = 1.0
 MIN_CONTRAST = 0.1
 MAX_CONTRAST = 5.0
 
-EPILOG = f"""使用例:
-  {config.APP_NAME} add badapple ~/Videos/bad-apple.mp4 --mode ascii
-  {config.APP_NAME} badapple
-  {config.APP_NAME} list
-  {config.APP_NAME} show badapple
-  {config.APP_NAME} edit badapple --mode color --audio
-  {config.APP_NAME} remove badapple
-  {config.APP_NAME} run ~/Videos/sample.mp4 --mode color
+def buildEpilog() -> str:
+  """ヘルプの末尾に表示する使用例を組み立てる（実際のコマンド名に合わせる）."""
+  name = config.commandName()
+  return f"""使用例:
+  {name} add badapple ~/Videos/bad-apple.mp4 --mode ascii
+  {name} badapple
+  {name} list
+  {name} show badapple
+  {name} edit badapple --mode color --audio
+  {name} remove badapple
+  {name} run ~/Videos/sample.mp4 --mode color
+
+URLから再生する（yt-dlp が必要です）:
+  {name} run "https://www.youtube.com/watch?v=XXXXXXXXXXX" --mode color
+  {name} add opening "https://www.youtube.com/watch?v=XXXXXXXXXXX" --quality 480
+  {name} run "<URL>" --cookies-from-browser chrome   # 年齢制限などの動画
+  {name} cache --clear
 
 再生中の操作:
   q: 終了 / space: 一時停止・再開 / r: 先頭から / m: ミュート / +,-: 再生速度
+
+URLは引用符で囲んでください（zshでは `?` がエラーになります）．
 """
 
 
@@ -130,6 +171,30 @@ def contrastValue(rawValue: str) -> float:
       f"{MIN_CONTRAST}〜{MAX_CONTRAST} の範囲で指定してください．"
     )
   return number
+
+
+def optionalText(rawValue: str) -> str | None:
+  """文字列，または既定へ戻すことを意味する None へ変換する."""
+  if rawValue.lower() in AUTO_KEYWORDS:
+    return None
+  return rawValue
+
+
+def cookieBrowserValue(rawValue: str) -> str | None:
+  """Cookieを読み出すブラウザの指定を検証する.
+
+  yt-dlp と同じく `chrome:Profile 1` のようなプロファイル指定も受け付ける.
+  """
+  if rawValue.lower() in AUTO_KEYWORDS:
+    return None
+
+  browserName = rawValue.split(":", 1)[0].strip().lower()
+  if browserName not in config.SUPPORTED_COOKIE_BROWSERS:
+    raise argparse.ArgumentTypeError(
+      f"対応していないブラウザです: {rawValue}"
+      f"（指定できる値: {'，'.join(config.SUPPORTED_COOKIE_BROWSERS)}）"
+    )
+  return rawValue
 
 
 def charsetValue(rawValue: str) -> str | None:
@@ -211,6 +276,58 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
     help=f"コントラスト補正（{MIN_CONTRAST}〜{MAX_CONTRAST}，既定: {config.DEFAULT_CONTRAST}）",
   )
 
+  parser.add_argument(
+    "--quality",
+    choices=config.QUALITY_CHOICES,
+    default=UNSET,
+    help=f"URL再生時の画質（既定: {config.DEFAULT_QUALITY}）",
+  )
+  parser.add_argument(
+    "--cache",
+    dest="cache",
+    action="store_const",
+    const=True,
+    default=UNSET,
+    help="URL再生時に，ダウンロードしてから再生する",
+  )
+  parser.add_argument(
+    "--no-cache",
+    dest="cache",
+    action="store_const",
+    const=False,
+    help="URL再生時に，ダウンロードせず直接再生する",
+  )
+  parser.add_argument(
+    "--cookies-from-browser",
+    dest="cookiesFromBrowser",
+    type=cookieBrowserValue,
+    default=UNSET,
+    metavar="ブラウザ",
+    help=(
+      "ログイン済みブラウザのCookieを使う"
+      f"（{'，'.join(config.SUPPORTED_COOKIE_BROWSERS)}）"
+    ),
+  )
+  parser.add_argument(
+    "--cookies",
+    dest="cookiesFile",
+    type=optionalText,
+    default=UNSET,
+    metavar="ファイル",
+    help="書き出したCookieファイルを使う",
+  )
+  parser.add_argument(
+    "--player-client",
+    dest="playerClient",
+    type=optionalText,
+    default=UNSET,
+    metavar="名前",
+    help=(
+      "YouTubeの取得方法を切り替える"
+      f"（例: {'，'.join(config.COMMON_PLAYER_CLIENTS)}）"
+    ),
+  )
+
   if includeStatus:
     parser.add_argument(
       "--no-status",
@@ -225,15 +342,15 @@ def addPlaybackArguments(parser: argparse.ArgumentParser, includeStatus: bool) -
 def buildParser() -> argparse.ArgumentParser:
   """サブコマンドを含むパーサを構築する."""
   parser = argparse.ArgumentParser(
-    prog=config.APP_NAME,
+    prog=config.commandName(),
     description="動画をターミナル上でASCII・ANSIカラーとして再生するCLIツールです．",
-    epilog=EPILOG,
+    epilog=buildEpilog(),
     formatter_class=argparse.RawDescriptionHelpFormatter,
   )
   parser.add_argument(
     "--version",
     action="version",
-    version=f"{config.APP_NAME} {config.VERSION}",
+    version=f"{config.commandName()} {config.VERSION}",
     help="バージョンを表示する",
   )
 
@@ -241,10 +358,12 @@ def buildParser() -> argparse.ArgumentParser:
 
   # add ---------------------------------------------------------------------
   addParser = subparsers.add_parser(
-    "add", help="動画に名前を付けて登録する", description="動画に名前を付けて登録します．"
+    "add",
+    help="動画に名前を付けて登録する",
+    description="動画ファイルまたはURLに名前を付けて登録します．",
   )
   addParser.add_argument("name", help="登録名")
-  addParser.add_argument("path", help="動画ファイルのパス")
+  addParser.add_argument("path", help="動画ファイルのパス，またはURL")
   addPlaybackArguments(addParser, includeStatus=False)
   addParser.add_argument(
     "--force", action="store_true", help="同じ登録名がある場合に上書きする"
@@ -298,12 +417,23 @@ def buildParser() -> argparse.ArgumentParser:
   # run ---------------------------------------------------------------------
   runParser = subparsers.add_parser(
     "run",
-    help="動画ファイルを登録せずに再生する",
-    description="動画ファイルを登録せずに再生します．",
+    help="動画ファイルやURLを登録せずに再生する",
+    description="動画ファイルまたはURLを登録せずに再生します．",
   )
-  runParser.add_argument("path", help="動画ファイルのパス")
+  runParser.add_argument("path", help="動画ファイルのパス，またはURL")
   addPlaybackArguments(runParser, includeStatus=True)
   runParser.set_defaults(handler=handleRun)
+
+  # cache -------------------------------------------------------------------
+  cacheParser = subparsers.add_parser(
+    "cache",
+    help="ダウンロード済み動画を管理する",
+    description="URLからダウンロードした動画の一覧表示と削除を行います．",
+  )
+  cacheParser.add_argument(
+    "--clear", action="store_true", help="キャッシュをすべて削除する"
+  )
+  cacheParser.set_defaults(handler=handleCache)
 
   return parser
 
@@ -331,22 +461,27 @@ def valueOr(value: Any, defaultValue: Any) -> Any:
 
 
 def collectChanges(args: argparse.Namespace) -> dict[str, Any]:
-  """実際に指定された再生設定だけを辞書として取り出す."""
+  """実際に指定された設定だけを辞書として取り出す."""
   changes: dict[str, Any] = {}
-  for attribute in OVERRIDABLE_ATTRIBUTES:
-    if attribute == "showStatus":
-      continue  # ステータス表示は登録内容に保存しない
+  for attribute in STORED_ATTRIBUTES:
     value = getattr(args, attribute, UNSET)
     if not isinstance(value, _Unset):
       changes[attribute] = value
   return changes
 
 
+def storablePath(rawPath: str) -> str:
+  """登録する入力を，URLならそのまま，ファイルなら絶対パスへ変換する."""
+  if config.isUrl(rawPath):
+    return rawPath.strip()
+  return resolveVideoPath(rawPath)
+
+
 def handleAdd(args: argparse.Namespace) -> int:
-  """動画を登録する."""
+  """動画ファイルまたはURLを登録する."""
   entry = VideoEntry(
     name=args.name,
-    path=resolveVideoPath(args.path),
+    path=storablePath(args.path),
     mode=valueOr(args.mode, config.DEFAULT_MODE),
     audio=valueOr(args.audio, False),
     width=valueOr(args.width, None),
@@ -354,11 +489,18 @@ def handleAdd(args: argparse.Namespace) -> int:
     charset=valueOr(args.charset, None),
     brightness=valueOr(args.brightness, config.DEFAULT_BRIGHTNESS),
     contrast=valueOr(args.contrast, config.DEFAULT_CONTRAST),
+    quality=valueOr(args.quality, None),
+    cache=valueOr(args.cache, False),
+    cookiesFromBrowser=valueOr(args.cookiesFromBrowser, None),
+    cookiesFile=valueOr(args.cookiesFile, None),
+    playerClient=valueOr(args.playerClient, None),
   )
 
   Registry().add(entry, force=args.force)
   print(f"「{entry.name}」を登録しました．")
-  print(f"再生するには `{config.APP_NAME} {entry.name}` を実行してください．")
+  if entry.isRemote and not source.isAvailable():
+    print("注意: URLの再生には yt-dlp が必要です（python -m pip install yt-dlp）．")
+  print(f"再生するには `{config.commandName()} {entry.name}` を実行してください．")
   return EXIT_OK
 
 
@@ -367,7 +509,7 @@ def handleList(args: argparse.Namespace) -> int:
   entries = Registry().load()
   if not entries:
     print("登録されている動画はありません．")
-    print(f"`{config.APP_NAME} add <登録名> <動画ファイル>` で登録できます．")
+    print(f"`{config.commandName()} add <登録名> <動画ファイル>` で登録できます．")
     return EXIT_OK
 
   headers = ("NAME", "MODE", "AUDIO", "WIDTH", "FPS", "VIDEO")
@@ -404,7 +546,7 @@ def handleShow(args: argparse.Namespace) -> int:
 
   items = [
     ("登録名", entry.name),
-    ("動画ファイル", entry.path),
+    ("URL" if entry.isRemote else "動画ファイル", entry.path),
     ("描画モード", entry.mode),
     ("音声", "再生する" if entry.audio else "再生しない"),
     ("最大表示幅", "auto" if entry.width is None else f"{entry.width} 桁"),
@@ -413,6 +555,23 @@ def handleShow(args: argparse.Namespace) -> int:
     ("明るさ", f"{entry.brightness:g}"),
     ("コントラスト", f"{entry.contrast:g}"),
   ]
+
+  if entry.isRemote:
+    qualityLabel = entry.quality or f"{config.DEFAULT_QUALITY}（既定）"
+    cacheLabel = "ダウンロードして再生" if entry.cache else "直接ストリーミング"
+    cachedFile = entry.cachedFile()
+    if cachedFile is not None:
+      cacheLabel += f"（保存済み: {cachedFile}）"
+    items.append(("画質", qualityLabel))
+    items.append(("キャッシュ", cacheLabel))
+
+    if entry.cookiesFromBrowser:
+      items.append(("Cookie", f"{entry.cookiesFromBrowser} のログイン情報を使用"))
+    elif entry.cookiesFile:
+      items.append(("Cookie", entry.cookiesFile))
+
+    if entry.playerClient:
+      items.append(("取得方法", entry.playerClient))
 
   labelWidth = max(displayWidth(label) for label, _ in items)
   for label, value in items:
@@ -429,7 +588,7 @@ def handleEdit(args: argparse.Namespace) -> int:
   if not changes:
     raise FraTermError(
       "変更する項目が指定されていません．",
-      hint=f"例: {config.APP_NAME} edit {args.name} --mode color --audio",
+      hint=f"例: {config.commandName()} edit {args.name} --mode color --audio",
     )
 
   entry = Registry().update(args.name, changes)
@@ -455,29 +614,122 @@ def handlePlay(args: argparse.Namespace) -> int:
     raise VideoFileError(
       f"「{entry.name}」の動画ファイルが見つかりません: {entry.path}",
       hint=(
-        f"ファイルを元の場所へ戻すか，`{config.APP_NAME} add {entry.name} "
+        f"ファイルを元の場所へ戻すか，`{config.commandName()} add {entry.name} "
         f"<新しいパス> --force` で登録し直してください．"
       ),
     )
 
+  playable = resolvePlaybackSource(entry, args)
+
   options = playerModule.PlaybackOptions.fromEntry(entry)
+  options.duration = playable.duration
   applyOverrides(options, args)
-  return startPlayback(playerModule, entry.path, options)
+  return startPlayback(playerModule, playable.path, options)
 
 
 def handleRun(args: argparse.Namespace) -> int:
-  """登録せずに動画ファイルを再生する."""
+  """登録せずに動画ファイルやURLを再生する."""
   playerModule = importPlayerModule()
 
-  videoPath = resolveVideoPath(args.path)
-  options = playerModule.PlaybackOptions(title=Path(videoPath).name)
+  quality, useCache, cookies = sourceSettings(args)
+  playable = source.openSource(args.path, quality, useCache, notifyProgress, cookies)
+
+  options = playerModule.PlaybackOptions(
+    title=playable.title, duration=playable.duration
+  )
   applyOverrides(options, args)
-  return startPlayback(playerModule, videoPath, options)
+  return startPlayback(playerModule, playable.path, options)
+
+
+def handleCache(args: argparse.Namespace) -> int:
+  """ダウンロード済み動画の一覧表示と削除を行う."""
+  if args.clear:
+    removedCount, removedSize = source.clearCache()
+    if removedCount == 0:
+      print("削除するキャッシュはありません．")
+    else:
+      print(f"{removedCount}件（{formatBytes(removedSize)}）を削除しました．")
+    return EXIT_OK
+
+  files = source.cachedFiles()
+  print(f"保存先: {config.cacheDir()}")
+  if not files:
+    print("キャッシュはありません．")
+    return EXIT_OK
+
+  totalSize = 0
+  for filePath in files:
+    fileSize = filePath.stat().st_size
+    totalSize += fileSize
+    print(f"  {filePath.name}  {formatBytes(fileSize)}")
+
+  print(f"合計 {len(files)}件  {formatBytes(totalSize)}")
+  print(f"削除するには `{config.commandName()} cache --clear` を実行してください．")
+  return EXIT_OK
+
+
+def formatBytes(sizeInBytes: int) -> str:
+  """バイト数を読みやすい単位へ変換する."""
+  size = float(sizeInBytes)
+  for unit in BYTE_UNITS:
+    if size < BYTES_PER_UNIT or unit == BYTE_UNITS[-1]:
+      return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+    size /= BYTES_PER_UNIT
+  return f"{size:.1f} {BYTE_UNITS[-1]}"
+
+
+def resolvePlaybackSource(entry: VideoEntry, args: argparse.Namespace):
+  """登録内容から，実際に再生する入力を決める."""
+  quality, useCache, cookies = sourceSettings(args, entry)
+
+  if entry.isRemote and useCache:
+    cachedFile = entry.cachedFile()
+    if cachedFile is not None:
+      # ダウンロード済みなら，ネットワークに接続せずそのまま再生する
+      notifyProgress(f"ダウンロード済みの動画を再生します: {cachedFile}")
+      return source.PlayableSource(path=str(cachedFile), title=entry.name)
+
+  # URLの直リンクは時間で失効するため，再生のたびに解決し直す
+  playable = source.openSource(
+    entry.path, quality, useCache, notifyProgress, cookies
+  )
+
+  if entry.isRemote and useCache and not playable.isRemote:
+    # 次回以降に再利用できるよう，保存先を登録内容へ記録する
+    Registry().update(entry.name, {"cachedPath": playable.path})
+
+  return playable
+
+
+def sourceSettings(
+  args: argparse.Namespace, entry: VideoEntry | None = None
+) -> tuple[str | None, bool, source.AccessOptions]:
+  """URLの解決に使う画質・キャッシュ・Cookieの設定を決める."""
+  quality = valueOr(getattr(args, "quality", UNSET), entry.quality if entry else None)
+  useCache = valueOr(getattr(args, "cache", UNSET), entry.cache if entry else False)
+  cookies = source.AccessOptions.resolve(
+    valueOr(
+      getattr(args, "cookiesFromBrowser", UNSET),
+      entry.cookiesFromBrowser if entry else None,
+    ),
+    valueOr(
+      getattr(args, "cookiesFile", UNSET), entry.cookiesFile if entry else None
+    ),
+    valueOr(
+      getattr(args, "playerClient", UNSET), entry.playerClient if entry else None
+    ),
+  )
+  return quality, bool(useCache), cookies
+
+
+def notifyProgress(message: str) -> None:
+  """再生前の進捗を標準エラー出力へ表示する（映像の出力を汚さないため）."""
+  print(message, file=sys.stderr)
 
 
 def applyOverrides(options: Any, args: argparse.Namespace) -> None:
   """コマンドラインで指定された項目だけを再生設定へ反映する."""
-  for attribute in OVERRIDABLE_ATTRIBUTES:
+  for attribute in PLAYBACK_ATTRIBUTES:
     value = getattr(args, attribute, UNSET)
     if not isinstance(value, _Unset):
       setattr(options, attribute, value)

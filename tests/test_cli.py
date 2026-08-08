@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
-from fraterm import cli, config
+from fraterm import cli, config, source
 from fraterm.registry import Registry
+
+# テストで使用するダミーのURL
+SAMPLE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+# 解決済みの直リンクを模したURL
+RESOLVED_URL = "https://example.invalid/stream.mp4"
 
 
 class RecordingPlayer:
@@ -229,6 +237,271 @@ def test_invalidOptionValueExits(dummyVideo, capsys):
 def test_expandImplicitPlay(rawArgs, expected):
   """登録名の省略記法が正しく展開されることを確認する."""
   assert cli.expandImplicitPlay(rawArgs) == expected
+
+
+@pytest.fixture
+def recordedSources(monkeypatch):
+  """URLの解決処理を差し替え，渡された引数を記録できるようにする."""
+  calls: list[dict] = []
+
+  def fakeOpenSource(pathOrUrl, quality=None, useCache=False, notify=None, cookies=None):
+    calls.append(
+      {
+        "path": pathOrUrl,
+        "quality": quality,
+        "cache": useCache,
+        "cookies": cookies,
+      }
+    )
+    return source.PlayableSource(
+      path=RESOLVED_URL, title="テスト動画", duration=212.0, isRemote=True
+    )
+
+  monkeypatch.setattr(cli.source, "openSource", fakeOpenSource)
+  return calls
+
+
+def test_addUrlStoresUrlAsIs(capsys):
+  """URLがそのまま登録されることを確認する."""
+  assert cli.main(["add", "opening", SAMPLE_URL, "--quality", "720", "--cache"]) == cli.EXIT_OK
+  capsys.readouterr()
+
+  entry = Registry().get("opening")
+  assert entry.path == SAMPLE_URL
+  assert entry.isRemote is True
+  assert entry.quality == "720"
+  assert entry.cache is True
+
+
+def test_addUrlWarnsWhenYtdlpMissing(monkeypatch, capsys):
+  """yt-dlp が無い場合に登録時点で案内が出ることを確認する."""
+  monkeypatch.setattr(cli.source, "isAvailable", lambda: False)
+
+  cli.main(["add", "opening", SAMPLE_URL])
+  assert "yt-dlp" in capsys.readouterr().out
+
+
+def test_showUrlEntryDisplaysUrlSettings(capsys):
+  """URL登録の詳細に画質とキャッシュ設定が表示されることを確認する."""
+  cli.main(["add", "opening", SAMPLE_URL, "--quality", "360"])
+  capsys.readouterr()
+
+  assert cli.main(["show", "opening"]) == cli.EXIT_OK
+  output = capsys.readouterr().out
+  assert "URL" in output
+  assert "360" in output
+  assert "直接ストリーミング" in output
+
+
+def test_playUrlResolvesWithStoredSettings(recordedSources, recordedPlayers):
+  """登録したURLが，保存した画質で解決されてから再生されることを確認する."""
+  cli.main(["add", "opening", SAMPLE_URL, "--quality", "720"])
+
+  assert cli.main(["opening"]) == cli.EXIT_OK
+  assert len(recordedSources) == 1
+  assert recordedSources[0]["path"] == SAMPLE_URL
+  assert recordedSources[0]["quality"] == "720"
+  assert recordedSources[0]["cache"] is False
+
+  played = recordedPlayers[0]
+  assert played.videoPath == RESOLVED_URL
+  assert played.options.duration == 212.0
+  assert played.options.title == "opening"
+
+
+def test_playUrlOverridesQualityWithoutSaving(recordedSources, recordedPlayers):
+  """再生時の画質指定が登録内容へ保存されないことを確認する."""
+  cli.main(["add", "opening", SAMPLE_URL, "--quality", "720"])
+  cli.main(["play", "opening", "--quality", "360", "--cache"])
+
+  assert recordedSources[0]["quality"] == "360"
+  assert recordedSources[0]["cache"] is True
+  assert Registry().get("opening").quality == "720"
+  assert Registry().get("opening").cache is False
+
+
+def test_runUrlWithoutRegistration(recordedSources, recordedPlayers):
+  """run でURLを直接再生できることを確認する."""
+  assert cli.main(["run", SAMPLE_URL, "--mode", "color"]) == cli.EXIT_OK
+
+  assert recordedSources[0]["path"] == SAMPLE_URL
+  assert recordedPlayers[0].videoPath == RESOLVED_URL
+  # 登録していない場合は動画のタイトルを表示に使う
+  assert recordedPlayers[0].options.title == "テスト動画"
+  assert Registry().names() == []
+
+
+def test_editUrlQuality(capsys):
+  """edit で画質とキャッシュ設定を変更できることを確認する."""
+  cli.main(["add", "opening", SAMPLE_URL])
+  capsys.readouterr()
+
+  assert cli.main(["edit", "opening", "--quality", "1080", "--cache"]) == cli.EXIT_OK
+  entry = Registry().get("opening")
+  assert entry.quality == "1080"
+  assert entry.cache is True
+
+
+def test_cookieSettingsArePersistedAndUsed(recordedSources, recordedPlayers, capsys):
+  """Cookieの指定が登録され，再生時に使われることを確認する."""
+  cli.main(["add", "restricted", SAMPLE_URL, "--cookies-from-browser", "chrome"])
+  capsys.readouterr()
+
+  assert Registry().get("restricted").cookiesFromBrowser == "chrome"
+
+  assert cli.main(["restricted"]) == cli.EXIT_OK
+  assert recordedSources[0]["cookies"].fromBrowser == "chrome"
+
+
+def test_cookieOverrideAtPlaytime(recordedSources, recordedPlayers):
+  """再生時のCookie指定が登録内容より優先されることを確認する."""
+  cli.main(["add", "restricted", SAMPLE_URL, "--cookies-from-browser", "chrome"])
+  cli.main(["play", "restricted", "--cookies-from-browser", "safari"])
+
+  assert recordedSources[0]["cookies"].fromBrowser == "safari"
+  assert Registry().get("restricted").cookiesFromBrowser == "chrome"
+
+
+def test_showDisplaysCookieSetting(capsys):
+  """詳細表示にCookieの設定が現れることを確認する."""
+  cli.main(["add", "restricted", SAMPLE_URL, "--cookies-from-browser", "firefox"])
+  capsys.readouterr()
+
+  cli.main(["show", "restricted"])
+  output = capsys.readouterr().out
+  assert "Cookie" in output
+  assert "firefox" in output
+
+
+def test_playerClientIsPersistedAndUsed(recordedSources, recordedPlayers, capsys):
+  """取得方法の指定が登録され，再生時に使われることを確認する."""
+  cli.main(["add", "restricted", SAMPLE_URL, "--player-client", "mweb"])
+  capsys.readouterr()
+
+  assert Registry().get("restricted").playerClient == "mweb"
+
+  assert cli.main(["restricted"]) == cli.EXIT_OK
+  assert recordedSources[0]["cookies"].playerClient == "mweb"
+
+
+def test_unsupportedBrowserIsRejected(capsys):
+  """対応していないブラウザ名が拒否されることを確認する."""
+  with pytest.raises(SystemExit) as exitInfo:
+    cli.main(["run", SAMPLE_URL, "--cookies-from-browser", "netscape"])
+  assert exitInfo.value.code != 0
+
+
+def test_browserProfileSpecIsAccepted(recordedSources, recordedPlayers):
+  """プロファイル付きのブラウザ指定を受け付けることを確認する."""
+  assert cli.main(["run", SAMPLE_URL, "--cookies-from-browser", "chrome:Profile 1"]) == cli.EXIT_OK
+  assert recordedSources[0]["cookies"].fromBrowser == "chrome:Profile 1"
+
+
+def test_cachedFileIsReusedWithoutNetwork(
+  tmp_path, monkeypatch, recordedSources, recordedPlayers
+):
+  """ダウンロード済みなら，URLを解決せずに再生することを確認する."""
+  cachedFile = tmp_path / "cached.mp4"
+  cachedFile.write_bytes(b"\x00")
+
+  cli.main(["add", "opening", SAMPLE_URL, "--cache"])
+  Registry().update("opening", {"cachedPath": str(cachedFile)})
+
+  assert cli.main(["opening"]) == cli.EXIT_OK
+  assert recordedSources == []  # ネットワーク処理を呼んでいない
+  assert recordedPlayers[0].videoPath == str(cachedFile)
+
+
+def test_downloadedPathIsRemembered(tmp_path, monkeypatch, recordedPlayers):
+  """ダウンロードした保存先が登録内容へ記録されることを確認する."""
+  downloadedFile = tmp_path / "downloaded.mp4"
+  downloadedFile.write_bytes(b"\x00")
+
+  def fakeOpenSource(pathOrUrl, quality=None, useCache=False, notify=None, cookies=None):
+    return source.PlayableSource(
+      path=str(downloadedFile), title="テスト動画", duration=10.0, isRemote=False
+    )
+
+  monkeypatch.setattr(cli.source, "openSource", fakeOpenSource)
+
+  cli.main(["add", "opening", SAMPLE_URL, "--cache"])
+  assert cli.main(["opening"]) == cli.EXIT_OK
+
+  assert Registry().get("opening").cachedPath == str(downloadedFile)
+
+
+def test_missingCachedFileFallsBackToResolve(recordedSources, recordedPlayers):
+  """保存先のファイルが消えていれば，改めて解決し直すことを確認する."""
+  cli.main(["add", "opening", SAMPLE_URL, "--cache"])
+  Registry().update("opening", {"cachedPath": "/存在しない/場所/video.mp4"})
+
+  assert cli.main(["opening"]) == cli.EXIT_OK
+  assert len(recordedSources) == 1
+  assert recordedPlayers[0].videoPath == RESOLVED_URL
+
+
+def test_cacheCommandListsAndClears(isolatedHome, capsys):
+  """cache コマンドで一覧表示と削除ができることを確認する."""
+  cacheDirectory = isolatedHome / config.CACHE_DIR_NAME
+  cacheDirectory.mkdir(parents=True, exist_ok=True)
+  (cacheDirectory / "video.mp4").write_bytes(b"\x00" * 2048)
+
+  assert cli.main(["cache"]) == cli.EXIT_OK
+  listing = capsys.readouterr().out
+  assert "video.mp4" in listing
+  assert "2.0 KB" in listing
+
+  assert cli.main(["cache", "--clear"]) == cli.EXIT_OK
+  assert "1件" in capsys.readouterr().out
+  assert list(cacheDirectory.iterdir()) == []
+
+
+def test_cacheCommandWithoutFiles(capsys):
+  """キャッシュが無い場合の表示を確認する."""
+  assert cli.main(["cache"]) == cli.EXIT_OK
+  assert "キャッシュはありません" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+  "sizeInBytes, expected",
+  [(512, "512 B"), (2048, "2.0 KB"), (5 * 1024 * 1024, "5.0 MB")],
+)
+def test_formatBytes(sizeInBytes, expected):
+  """バイト数が読みやすい単位へ変換されることを確認する."""
+  assert cli.formatBytes(sizeInBytes) == expected
+
+
+@pytest.mark.parametrize(
+  "invokedPath, expected",
+  [
+    ("/usr/local/bin/fraterm", "fraterm"),
+    ("/Users/me/.local/bin/ft", "ft"),
+    ("/path/to/fraterm/__main__.py", "fraterm"),
+    ("", "fraterm"),
+  ],
+)
+def test_commandNameFollowsInvocation(monkeypatch, invokedPath, expected):
+  """打たれたコマンド名が表示に反映されることを確認する."""
+  monkeypatch.setattr(sys, "argv", [invokedPath])
+  assert config.commandName() == expected
+
+
+def test_helpUsesShortCommandName(monkeypatch, capsys):
+  """短い名前で起動した場合，ヘルプの表示もその名前になることを確認する."""
+  monkeypatch.setattr(sys, "argv", ["/Users/me/.local/bin/ft"])
+
+  cli.main([])
+  output = capsys.readouterr().out
+  assert "usage: ft" in output
+  assert "ft add badapple" in output
+
+
+def test_errorHintUsesShortCommandName(monkeypatch, capsys):
+  """エラー時の案内も打たれたコマンド名になることを確認する."""
+  monkeypatch.setattr(sys, "argv", ["/Users/me/.local/bin/ft"])
+
+  assert cli.main(["play", "neko"]) == cli.EXIT_ERROR
+  assert "`ft list`" in capsys.readouterr().err
 
 
 def test_versionOption(capsys):
