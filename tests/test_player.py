@@ -146,6 +146,34 @@ def test_speedChangeIsClamped(dummyVideo):
   assert player._speed == config.MIN_SPEED
 
 
+def test_seekByClampsPositionAndUpdatesFrameIndex(dummyVideo):
+  """シークが秒数・フレーム番号・音声同期の基準を更新することを確認する."""
+  player = Player(dummyVideo, PlaybackOptions(), stream=io.StringIO())
+  player._videoFps = 10.0
+  player._duration = 60.0
+  player._mediaTime = lambda: 20.0
+  player._startClock = lambda: None
+  player._syncAudio = lambda: None
+
+  player._seekBy(config.SEEK_STEP_SECONDS)
+
+  assert player._mediaBase == 30.0
+  assert player._nextFrameIndex == 300
+
+
+def test_seekKeysUseTenSecondStep(dummyVideo):
+  """左右矢印とh/lがシーク操作へ割り当てられていることを確認する."""
+  from fraterm.keyboard import KEY_LEFT, KEY_RIGHT
+
+  player = Player(dummyVideo, stream=io.StringIO())
+  moved: list[float] = []
+  player._seekBy = lambda seconds: moved.append(seconds)
+
+  assert player._handleKey(KEY_LEFT) is True
+  assert player._handleKey("l") is True
+  assert moved == [-config.SEEK_STEP_SECONDS, config.SEEK_STEP_SECONDS]
+
+
 def test_missingVideoRaises(tmp_path):
   """存在しない動画を再生しようとした場合のエラーを確認する."""
   with pytest.raises(VideoFileError):

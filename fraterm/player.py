@@ -16,7 +16,7 @@ from . import audio as audioModule
 from . import config, renderer
 from .errors import PlaybackError, VideoFileError
 from .frame_reader import FrameReader
-from .keyboard import KeyReader
+from .keyboard import KEY_LEFT, KEY_RIGHT, KeyReader
 from .registry import VideoEntry
 from .textwidth import sanitizeText, truncateToWidth
 
@@ -36,7 +36,7 @@ DIM = f"{ESC}[2m"
 TERMINATION_SIGNALS = ("SIGTERM", "SIGHUP")
 
 # 再生中に表示する操作説明
-KEY_HELP = "[q/Esc]終了 [space]一時停止 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [s]保存"
+KEY_HELP = "[q/Esc]終了 [space]一時停止 [←/→]移動 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [s]保存"
 
 # 保存名として受け付ける最大文字数
 MAX_INPUT_LENGTH = 40
@@ -182,7 +182,7 @@ class Player:
     self._duration = 0.0
     self._nextFrameIndex = 0
     self._lastRenderedMedia: float | None = None
-    self._lastSize: tuple[int, int] | None = None
+    self._lastSize: tuple[int, int, int, int] | None = None
     self._letterboxBounds: tuple[int, int, int, int] | None = None
     self._preRenderedFrames: RenderedFrameStore | None = None
     self._preRenderedLayout: tuple[int, int, int, int] | None = None
@@ -251,8 +251,9 @@ class Player:
         self._preRenderedFrames.close()
         self._preRenderedFrames = None
         self._preRenderedLayout = None
-      capture.release()
-      self._capture = None
+      if self._capture is not None:
+        self._capture.release()
+        self._capture = None
       self._restoreTerminal()
       self._restoreSignalHandlers()
 
@@ -474,6 +475,11 @@ class Player:
           return
         continue
 
+      if self._preRenderedFrames is not None and self._terminalSizeChanged():
+        # 事前生成した文字列は端末サイズに依存するため，サイズ変更後は
+        # 現在位置から通常のフレーム読み込みへ安全に切り替える．
+        self._switchToLiveRendering()
+
       if not self._advanceToTargetFrame():
         return
 
@@ -559,6 +565,45 @@ class Player:
     self._nextFrameIndex += 1
     return frameText
 
+  def _terminalSizeChanged(self) -> bool:
+    """事前生成を開始した時点から端末サイズが変わったかどうかを返す."""
+    if self._preRenderedLayout is None:
+      return False
+    return self._terminalSize() != self._preRenderedLayout[2:]
+
+  def _switchToLiveRendering(self) -> bool:
+    """端末サイズ変更時に，現在位置から通常描画へ切り替える."""
+    if self._preRenderedFrames is None:
+      return True
+
+    import cv2
+
+    newCapture = cv2.VideoCapture(self.videoPath)
+    if not newCapture.isOpened():
+      newCapture.release()
+      # 再接続できないURLなどでは，古い生成結果を新しい端末の中央へ置く
+      # ことで再生を止めずに継続する．
+      terminalWidth, terminalHeight = self._terminalSize()
+      columns, rows, _, _ = self._preRenderedLayout or (0, 0, 0, 0)
+      self._preRenderedLayout = (columns, rows, terminalWidth, terminalHeight)
+      self._lastSize = None
+      return False
+
+    newReader = FrameReader(newCapture)
+    newReader.seek(cv2.CAP_PROP_POS_FRAMES, self._nextFrameIndex)
+
+    oldCapture = self._capture
+    oldStore = self._preRenderedFrames
+    self._frameReader = newReader
+    self._capture = newCapture
+    self._preRenderedFrames = None
+    self._preRenderedLayout = None
+    self._lastSize = None
+    oldStore.close()
+    if oldCapture is not None and oldCapture is not newCapture:
+      oldCapture.release()
+    return True
+
   def _readFrame(self):
     """フレームを1つ読み込む．動画の終端では None を返す."""
     if self._frameReader is not None:
@@ -594,6 +639,14 @@ class Player:
 
     if lowerKey == "r":
       self._restart()
+      return True
+
+    if key in (KEY_LEFT, "h"):
+      self._seekBy(-config.SEEK_STEP_SECONDS)
+      return True
+
+    if key in (KEY_RIGHT, "l"):
+      self._seekBy(config.SEEK_STEP_SECONDS)
       return True
 
     if lowerKey == "m":
@@ -644,6 +697,29 @@ class Player:
     self._nextFrameIndex = 0
     self._lastRenderedMedia = None
     self._mediaBase = 0.0
+    self._startClock()
+    self._syncAudio()
+
+  def _seekBy(self, seconds: float) -> None:
+    """現在位置から指定秒数だけ前後へ移動する."""
+    target = max(0.0, self._mediaTime() + seconds)
+    if self._duration > 0:
+      target = min(target, self._duration)
+
+    frameIndex = max(0, int(target * self._videoFps))
+    if self._preRenderedFrames is not None:
+      frameIndex = min(frameIndex, len(self._preRenderedFrames))
+    else:
+      import cv2
+
+      if self._frameReader is not None:
+        self._frameReader.seek(cv2.CAP_PROP_POS_FRAMES, frameIndex)
+      elif self._capture is not None:
+        self._capture.set(cv2.CAP_PROP_POS_FRAMES, frameIndex)
+
+    self._nextFrameIndex = frameIndex
+    self._lastRenderedMedia = None
+    self._mediaBase = target
     self._startClock()
     self._syncAudio()
 
