@@ -22,6 +22,9 @@ MAX_TEMPO = 2.0
 # プロセス終了を待つ最大時間（秒）
 TERMINATE_TIMEOUT = 1.0
 
+# 古い監視スレッドは世代確認で無害化できるため，操作を待たせない範囲だけ待つ
+STATUS_THREAD_JOIN_TIMEOUT = 0.05
+
 # ffplay の進捗表示から音声クロックを取り出す．音声だけを再生する場合も
 # ``-stats`` の先頭に現在位置と ``M-A``（音声との差）が出力される．
 AUDIO_STATUS_PATTERN = re.compile(
@@ -86,6 +89,11 @@ class AudioPlayer:
     self._readyEvent = threading.Event()
     self._statusLock = threading.Lock()
     self._lastAudioPosition: float | None = None
+    self._processStartedAt: float | None = None
+    self._requestedPosition = 0.0
+    self._statusIsRelative: bool | None = None
+    self._startupLatency: float | None = None
+    self._startupPositionOffset: float | None = None
     self._stderrThread: threading.Thread | None = None
     # 異常終了時にも音声プロセスが残らないようにする
     atexit.register(self.stop)
@@ -104,11 +112,10 @@ class AudioPlayer:
     ensureAvailable()
     self.stop()
     self._readyEvent.clear()
-    with self._statusLock:
-      self._lastAudioPosition = None
 
     clampedVolume = max(config.MIN_VOLUME, min(config.MAX_VOLUME, int(volume)))
 
+    requestedPosition = max(0.0, position)
     command = [
       FFPLAY_COMMAND,
       "-nodisp",  # 映像ウィンドウを表示しない
@@ -120,7 +127,7 @@ class AudioPlayer:
       "-volume",
       str(clampedVolume),
       "-ss",
-      f"{max(0.0, position):.3f}",
+      f"{requestedPosition:.3f}",
     ]
 
     if abs(speed - 1.0) > 1e-6:
@@ -128,21 +135,30 @@ class AudioPlayer:
 
     command.append(self.videoPath)
 
+    with self._statusLock:
+      self._lastAudioPosition = None
+      self._processStartedAt = time.perf_counter()
+      self._requestedPosition = requestedPosition
+      self._statusIsRelative = None
     try:
-      self._process = subprocess.Popen(
+      process = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
       )
     except OSError as error:
-      self._process = None
+      with self._statusLock:
+        self._process = None
+        self._processStartedAt = None
       raise AudioError(f"音声再生を開始できません（{error}）") from error
 
-    if self._process.stderr is not None:
+    with self._statusLock:
+      self._process = process
+    if process.stderr is not None:
       self._stderrThread = threading.Thread(
         target=self._readStatus,
-        args=(self._process, self._process.stderr),
+        args=(process, process.stderr),
         name="fraterm-audio-status",
         daemon=True,
       )
@@ -169,20 +185,55 @@ class AudioPlayer:
           separatorIndex = min(separators)
           status = pending[:separatorIndex]
           pending = pending[separatorIndex + 1 :]
-          self._recordStatus(status)
-      self._recordStatus(pending)
+          self._recordStatus(process, status)
+      self._recordStatus(process, pending)
     except (OSError, ValueError):
       # 停止時にパイプが閉じられた場合は通常の終了として扱う
       pass
 
-  def _recordStatus(self, status: str) -> None:
+  def _recordStatus(self, process, status: str) -> None:
     """1行分のffplay出力から音声位置を記録する."""
-    position = audioPositionFromStatus(status)
-    if position is None:
+    rawPosition = audioPositionFromStatus(status)
+    if rawPosition is None:
       return
     with self._statusLock:
+      # 停止済みプロセスの監視スレッドが遅れて終了しても，新しい再生の
+      # 準備完了通知や音声位置へ混ざらないようにする．
+      if process is not self._process:
+        return
+      if self._statusIsRelative is None:
+        # ffplay の進捗時刻はコンテナによって挙動が異なる．MP4/AAC は
+        # -ss の位置を 0 秒付近として出力し，WAV 等は絶対時刻を出力するため，
+        # 要求位置に近くなる方を選び，以後の進捗を同じ方式で正規化する．
+        absoluteDistance = abs(rawPosition - self._requestedPosition)
+        relativeDistance = abs(rawPosition)
+        self._statusIsRelative = relativeDistance < absoluteDistance
+      position = (
+        self._requestedPosition + rawPosition
+        if self._statusIsRelative
+        else rawPosition
+      )
+      if self._lastAudioPosition is None and self._processStartedAt is not None:
+        self._startupLatency = max(0.0, time.perf_counter() - self._processStartedAt)
+        self._startupPositionOffset = position - self._requestedPosition
       self._lastAudioPosition = position
     self._readyEvent.set()
+
+  def startupCompensation(self, speed: float = 1.0) -> float | None:
+    """次回起動時に映像と同時に音が始まるよう，開始位置の補正量を返す."""
+    with self._statusLock:
+      if self._startupLatency is None or self._startupPositionOffset is None:
+        return None
+      # 起動中に映像が進む量から，ffplayの先頭進捗に含まれるずれを差し引く．
+      return max(
+        0.0,
+        self._startupLatency * max(0.0, speed) - self._startupPositionOffset,
+      )
+
+  def currentPosition(self) -> float | None:
+    """直近にffplayから受け取った音声位置を返す."""
+    with self._statusLock:
+      return self._lastAudioPosition
 
   def waitUntilReady(self, timeout: float = config.AUDIO_READY_TIMEOUT) -> float | None:
     """音声クロックが動き始めるまで待ち，その時点の位置を返す."""
@@ -204,11 +255,14 @@ class AudioPlayer:
 
   def stop(self) -> None:
     """音声再生を停止する．プロセスが残らないよう確実に終了させる."""
-    process = self._process
-    self._process = None
+    with self._statusLock:
+      process = self._process
+      self._process = None
+      self._processStartedAt = None
     if process is not None and process.poll() is None:
       try:
-        process.terminate()
+        # 一時停止操作では音を即座に切る必要があるため，終了処理を待たない．
+        process.kill()
         process.wait(timeout=TERMINATE_TIMEOUT)
       except subprocess.TimeoutExpired:
         process.kill()
@@ -229,7 +283,7 @@ class AudioPlayer:
     self._stderrThread = None
     self._readyEvent.set()
     if statusThread is not None and statusThread is not threading.current_thread():
-      statusThread.join(timeout=TERMINATE_TIMEOUT)
+      statusThread.join(timeout=STATUS_THREAD_JOIN_TIMEOUT)
 
   def isPlaying(self) -> bool:
     """音声プロセスが動作中かどうかを返す."""

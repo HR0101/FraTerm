@@ -532,6 +532,54 @@ def test_audioReadyPositionRebasesVideoClock(dummyVideo):
   assert fakeAudio.waitTimeouts == [config.AUDIO_READY_TIMEOUT]
 
 
+class CompensatedAudioPlayer(FakeAudioPlayer):
+  """起動時間を学習済みの音声プレイヤー."""
+
+  def __init__(self, compensation: float) -> None:
+    super().__init__()
+    self.compensation = compensation
+    self.position: float | None = None
+
+  def startupCompensation(self, speed: float = 1.0) -> float:
+    return self.compensation * speed
+
+  def currentPosition(self) -> float | None:
+    return self.position
+
+
+def test_audioResumeStartsVideoWithoutWaiting(dummyVideo):
+  """再開時は音声準備を待たず，予測した位置から非同期で開始する."""
+  player = Player(dummyVideo, PlaybackOptions(audio=True), stream=io.StringIO())
+  fakeAudio = CompensatedAudioPlayer(0.2)
+  player._audioPlayer = fakeAudio
+  player._paused = True
+  player._mediaBase = 10.0
+
+  player._togglePause()
+
+  assert player._paused is False
+  assert fakeAudio.starts[-1]["position"] == pytest.approx(10.2, abs=0.02)
+  assert fakeAudio.waitTimeouts == []
+  assert player._pendingAudioSync is True
+  assert "音声同期中" in player._notice
+
+
+def test_firstAudioPositionFinishesAsyncSynchronization(dummyVideo):
+  """音が鳴り始めた瞬間の位置へ映像を合わせ，推測誤差を解消する."""
+  player = Player(dummyVideo, PlaybackOptions(audio=True), stream=io.StringIO())
+  fakeAudio = CompensatedAudioPlayer(0.2)
+  fakeAudio.position = 10.18
+  player._audioPlayer = fakeAudio
+  player._pendingAudioSync = True
+  player._startClock = lambda: None
+
+  player._alignToAudioIfReady()
+
+  assert player._mediaBase == pytest.approx(10.18)
+  assert player._pendingAudioSync is False
+  assert "同期しました" in player._notice
+
+
 def test_volumeKeysChangeVolume(dummyVideo):
   """[ と ] のキーで音量が変わり，音声を鳴らし直すことを確認する."""
   player, fakeAudio = makeAudioPlayer(dummyVideo, volume=50)
@@ -556,7 +604,7 @@ def test_volumeIsClamped(dummyVideo):
 
 
 def test_pauseStopsAudioAndResumeRestarts(dummyVideo):
-  """一時停止で音声が止まり，再開で鳴り直すことを確認する."""
+  """一時停止で音声が止まり，再開時に保存位置から鳴り直すことを確認する."""
   player, fakeAudio = makeAudioPlayer(dummyVideo)
 
   player._handleKey(" ")
