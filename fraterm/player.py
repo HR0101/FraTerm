@@ -236,6 +236,7 @@ class Player:
     self._preRenderedFrames: RenderedFrameStore | None = None
     self._preRenderedLayout: tuple[int, int, int, int] | None = None
     self._audioPlayer: audioModule.AudioPlayer | None = None
+    self._pendingAudioSync = False
     self._previousHandlers: dict = {}
     self._keyReader: KeyReader | None = None
     # 一時的にステータス行へ出す知らせ
@@ -479,18 +480,35 @@ class Player:
 
     if self._paused or self._muted:
       self._audioPlayer.stop()
+      self._pendingAudioSync = False
       return
 
-    # 音声を現在位置から起動し，ffplay自身の音声クロックが動き始めるまで
-    # 映像側のクロックを進めない．固定遅延を足すだけだと，環境ごとの
-    # ffplay起動時間の差によって映像が先行する．
+    # 初回はffplayの音声クロックを待って起動時間を実測する．2回目以降は
+    # その実測値で開始位置を補正し，映像を止めずに音声を準備する．
     mediaPosition = self._mediaTime()
+    startupCompensation = getattr(self._audioPlayer, "startupCompensation", None)
+    compensation = (
+      startupCompensation(self._speed)
+      if callable(startupCompensation)
+      else None
+    )
     startPosition = mediaPosition + self.options.audioOffset
+    if compensation is not None:
+      startPosition += compensation
     self._audioPlayer.start(
       position=startPosition,
       speed=self._speed,
       volume=self._volume,
     )
+
+    if compensation is not None:
+      # 前回実測した起動時間だけ先の位置から音声を準備し，映像ループは
+      # 待たずに再開する．最初の音声位置が届いた時点で再度ぴったり合わせる．
+      self._mediaBase = mediaPosition
+      self._startClock()
+      self._pendingAudioSync = True
+      self._showNotice("映像を再開しています（音声同期中）．")
+      return
 
     waitUntilReady = getattr(self._audioPlayer, "waitUntilReady", None)
     readyPosition = (
@@ -502,8 +520,30 @@ class Player:
       # ffplayの位置は音声側の補正を含むため，映像の位置へ戻す．
       mediaPosition = max(0.0, readyPosition - self.options.audioOffset)
 
+    self._pendingAudioSync = False
     self._mediaBase = mediaPosition
     self._startClock()
+
+  def _alignToAudioIfReady(self) -> None:
+    """非同期で再開した音声の最初の位置へ，映像クロックを一度だけ合わせる."""
+    if (
+      not self._pendingAudioSync
+      or self._audioPlayer is None
+      or self._paused
+      or self._muted
+    ):
+      return
+
+    currentPosition = getattr(self._audioPlayer, "currentPosition", None)
+    audioPosition = currentPosition() if callable(currentPosition) else None
+    if audioPosition is None:
+      return
+
+    self._mediaBase = max(0.0, audioPosition - self.options.audioOffset)
+    self._startClock()
+    self._lastRenderedMedia = None
+    self._pendingAudioSync = False
+    self._showNotice("音声と映像を同期しました．")
 
   # -------------------------------------------------------------------------
   # メインループ
@@ -514,6 +554,7 @@ class Player:
     # 保存操作でも同じ入力元を使う
     self._keyReader = keyReader
     while True:
+      self._alignToAudioIfReady()
       if not self._processPendingKeys(keyReader):
         return
 
