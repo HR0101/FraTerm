@@ -533,25 +533,25 @@ def test_audioReadyPositionRebasesVideoClock(dummyVideo):
 
 
 def test_volumeKeysChangeVolume(dummyVideo):
-  """9と0のキーで音量が変わり，音声を鳴らし直すことを確認する."""
+  """[ と ] のキーで音量が変わり，音声を鳴らし直すことを確認する."""
   player, fakeAudio = makeAudioPlayer(dummyVideo, volume=50)
 
-  player._handleKey("0")
+  player._handleKey("]")
   assert player._volume == 50 + config.VOLUME_STEP
   assert fakeAudio.starts[-1]["volume"] == player._volume
 
-  player._handleKey("9")
+  player._handleKey("[")
   assert player._volume == 50
 
 
 def test_volumeIsClamped(dummyVideo):
   """音量が上下限を超えないことを確認する."""
   player, _ = makeAudioPlayer(dummyVideo, volume=config.MAX_VOLUME)
-  player._handleKey("0")
+  player._handleKey("]")
   assert player._volume == config.MAX_VOLUME
 
   player, _ = makeAudioPlayer(dummyVideo, volume=config.MIN_VOLUME)
-  player._handleKey("9")
+  player._handleKey("[")
   assert player._volume == config.MIN_VOLUME
 
 

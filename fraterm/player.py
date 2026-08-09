@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import time
+from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable, TextIO
@@ -18,7 +19,7 @@ from .errors import PlaybackError, VideoFileError
 from .frame_reader import FrameReader
 from .keyboard import KEY_LEFT, KEY_RIGHT, KeyReader
 from .registry import VideoEntry
-from .textwidth import sanitizeText, truncateToWidth
+from .textwidth import displayWidth, sanitizeText, truncateToWidth
 
 # ターミナル制御用のエスケープシーケンス
 ESC = "\x1b"
@@ -35,15 +36,61 @@ DIM = f"{ESC}[2m"
 # 後始末を必要とする終了シグナル（Windows に無いものは実行時に読み飛ばす）
 TERMINATION_SIGNALS = ("SIGTERM", "SIGHUP")
 
-# 再生中に表示する操作説明
-KEY_HELP = "[q/Esc]終了 [space]一時停止 [0-9]位置 [←/→]移動 [r]先頭 [m]消音 [+/-]速度 [ / ]音量 [s]保存"
+# 再生中に表示する操作説明．
+# 左から表示順に並べ，画面が狭いときは priority の小さいものだけを残す．
+# audioOnly の項目は，音声を鳴らしていないときは案内しても意味がないので省く．
+KeyHint = namedtuple("KeyHint", ("text", "priority", "audioOnly"))
+KEY_HINTS = (
+  KeyHint("[q/Esc]終了", 1, False),
+  KeyHint("[space]一時停止", 2, False),
+  KeyHint("[←/→]移動", 3, False),
+  KeyHint("[0-9]位置", 6, False),
+  KeyHint("[r]先頭", 7, False),
+  KeyHint("[m]消音", 5, True),
+  KeyHint("[+/-]速度", 8, False),
+  KeyHint("[[/]]音量", 4, True),
+  KeyHint("[s]保存", 9, False),
+)
+
+# 案内どうしの区切り
+HINT_SEPARATOR = " "
+
+# 長い題名で操作説明が押し出されないよう，題名に許す最大幅の目安
+TITLE_MIN_WIDTH = 12
+TITLE_WIDTH_RATIO = 4
+
+# 再生速度が既定のままかを判定するときの許容差
+SPEED_EPSILON = 1e-9
 
 # 数字キーを動画位置へ割り当てるため，音量操作は角括弧へ移す
 VOLUME_DOWN_KEY = "["
 VOLUME_UP_KEY = "]"
 
+# 操作できなかった理由などを表示しておく秒数
+NOTICE_SECONDS = 2.5
+
 # エラー表示でURLを短く見せるときの幅
 MAX_SOURCE_LABEL_WIDTH = 60
+
+
+def buildKeyHelp(availableWidth: int, withAudio: bool) -> str:
+  """与えられた幅に収まる操作説明を組み立てる."""
+  candidates = [hint for hint in KEY_HINTS if withAudio or not hint.audioOnly]
+
+  chosen: list[KeyHint] = []
+  usedWidth = 0
+  # 優先度の高いものから詰め，入らないものは飛ばす
+  for hint in sorted(candidates, key=lambda hint: hint.priority):
+    needed = displayWidth(hint.text) + (len(HINT_SEPARATOR) if chosen else 0)
+    if usedWidth + needed > availableWidth:
+      continue
+    chosen.append(hint)
+    usedWidth += needed
+
+  # 並びは元の表示順へ戻し，キーの位置が幅によって動かないようにする
+  chosen.sort(key=candidates.index)
+  return HINT_SEPARATOR.join(hint.text for hint in chosen)
+
 
 # 保存名として受け付ける最大文字数
 MAX_INPUT_LENGTH = 40
@@ -191,6 +238,9 @@ class Player:
     self._audioPlayer: audioModule.AudioPlayer | None = None
     self._previousHandlers: dict = {}
     self._keyReader: KeyReader | None = None
+    # 一時的にステータス行へ出す知らせ
+    self._notice = ""
+    self._noticeUntil = 0.0
 
   # -------------------------------------------------------------------------
   # 再生の入口
@@ -662,14 +712,12 @@ class Player:
       return True
 
     if len(key) == 1 and key in "0123456789":
+      # 0〜9 は常に「動画の 0〜90% の位置へ移動」とする．
+      # 動画によって音量操作へ変わると，同じキーの意味が二通りになるため．
       if self._duration > 0:
-        # 0〜9 は動画の 0〜90% の位置へ移動する
         self._seekToFraction(int(key) / 10.0)
-      elif key == "0":
-        # 長さを取得できないストリームではシークできないため旧操作を維持する
-        self._changeVolume(config.VOLUME_STEP)
-      elif key == "9":
-        self._changeVolume(-config.VOLUME_STEP)
+      else:
+        self._showNotice("この動画は長さが分からないため，位置を移動できません．")
       return True
 
     if key == VOLUME_UP_KEY:
@@ -1000,25 +1048,40 @@ class Player:
     )
     self._write(self._statusText(rows, terminalWidth, topOffset))
 
+  def _showNotice(self, message: str) -> None:
+    """操作できなかった理由などを，ステータス行へ少しの間だけ表示する."""
+    self._notice = message
+    self._noticeUntil = time.perf_counter() + NOTICE_SECONDS
+
   def _statusText(self, rows: int, terminalWidth: int, rowOffset: int = 0) -> str:
     """画面下部に表示するステータス行を組み立てる."""
+    if self._notice and time.perf_counter() < self._noticeUntil:
+      body = truncateToWidth(self._notice, max(0, terminalWidth))
+      return f"{ESC}[{rowOffset + rows + 1};1H{DIM}{body}{RESET_ATTRIBUTES}{CLEAR_LINE}"
+
+    self._notice = ""
     state = "一時停止" if self._paused else "再生中"
     position = formatTime(self._mediaTime())
     total = formatTime(self._duration) if self._duration > 0 else "--:--"
-    if self._audioPlayer is None:
-      audioState = "-"
-    elif self._muted:
-      audioState = "消音"
-    else:
-      audioState = f"{self._volume}%"
     # 動画のタイトルは外部由来のため，制御文字を取り除いてから表示する
     title = sanitizeText(self.options.title or Path(self.videoPath).name)
+    # 題名が長くても操作説明が消えないように，題名の幅を抑える
+    title = truncateToWidth(title, max(TITLE_MIN_WIDTH, terminalWidth // TITLE_WIDTH_RATIO))
 
-    body = (
-      f"{state} {title}  {position}/{total}  x{self._speed:.2f}  "
-      f"{self.options.mode}  音声:{audioState}  {KEY_HELP}"
+    # 既定のままの項目は書かず，操作説明のための幅を空ける
+    parts = [f"{state} {title}", f"{position}/{total}"]
+    if abs(self._speed - 1.0) > SPEED_EPSILON:
+      parts.append(f"x{self._speed:.2f}")
+    parts.append(self.options.mode)
+    if self._audioPlayer is not None:
+      parts.append(f"音声:{'消音' if self._muted else f'{self._volume}%'}")
+    leading = "  ".join(parts) + "  "
+    # 残った幅に収まる操作説明だけを並べる
+    keyHelp = buildKeyHelp(
+      max(0, terminalWidth - displayWidth(leading)),
+      self._audioPlayer is not None,
     )
-    body = truncateToWidth(body, max(0, terminalWidth))
+    body = truncateToWidth(leading + keyHelp, max(0, terminalWidth))
 
     # ステータス行は中央配置した描画領域のすぐ下へ表示する
     return f"{ESC}[{rowOffset + rows + 1};1H{DIM}{body}{RESET_ATTRIBUTES}{CLEAR_LINE}"
