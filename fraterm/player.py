@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import time
+from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable, TextIO
@@ -18,7 +19,7 @@ from .errors import PlaybackError, VideoFileError
 from .frame_reader import FrameReader
 from .keyboard import KEY_LEFT, KEY_RIGHT, KeyReader
 from .registry import VideoEntry
-from .textwidth import sanitizeText, truncateToWidth
+from .textwidth import displayWidth, sanitizeText, truncateToWidth
 
 # ターミナル制御用のエスケープシーケンス
 ESC = "\x1b"
@@ -35,11 +36,61 @@ DIM = f"{ESC}[2m"
 # 後始末を必要とする終了シグナル（Windows に無いものは実行時に読み飛ばす）
 TERMINATION_SIGNALS = ("SIGTERM", "SIGHUP")
 
-# 再生中に表示する操作説明
-KEY_HELP = "[q/Esc]終了 [space]一時停止 [←/→]移動 [r]先頭 [m]消音 [+/-]速度 [9/0]音量 [s]保存"
+# 再生中に表示する操作説明．
+# 左から表示順に並べ，画面が狭いときは priority の小さいものだけを残す．
+# audioOnly の項目は，音声を鳴らしていないときは案内しても意味がないので省く．
+KeyHint = namedtuple("KeyHint", ("text", "priority", "audioOnly"))
+KEY_HINTS = (
+  KeyHint("[q/Esc]終了", 1, False),
+  KeyHint("[space]一時停止", 2, False),
+  KeyHint("[←/→]移動", 3, False),
+  KeyHint("[0-9]位置", 6, False),
+  KeyHint("[r]先頭", 7, False),
+  KeyHint("[m]消音", 5, True),
+  KeyHint("[+/-]速度", 8, False),
+  KeyHint("[[/]]音量", 4, True),
+  KeyHint("[s]保存", 9, False),
+)
+
+# 案内どうしの区切り
+HINT_SEPARATOR = " "
+
+# 長い題名で操作説明が押し出されないよう，題名に許す最大幅の目安
+TITLE_MIN_WIDTH = 12
+TITLE_WIDTH_RATIO = 4
+
+# 再生速度が既定のままかを判定するときの許容差
+SPEED_EPSILON = 1e-9
+
+# 数字キーを動画位置へ割り当てるため，音量操作は角括弧へ移す
+VOLUME_DOWN_KEY = "["
+VOLUME_UP_KEY = "]"
+
+# 操作できなかった理由などを表示しておく秒数
+NOTICE_SECONDS = 2.5
 
 # エラー表示でURLを短く見せるときの幅
 MAX_SOURCE_LABEL_WIDTH = 60
+
+
+def buildKeyHelp(availableWidth: int, withAudio: bool) -> str:
+  """与えられた幅に収まる操作説明を組み立てる."""
+  candidates = [hint for hint in KEY_HINTS if withAudio or not hint.audioOnly]
+
+  chosen: list[KeyHint] = []
+  usedWidth = 0
+  # 優先度の高いものから詰め，入らないものは飛ばす
+  for hint in sorted(candidates, key=lambda hint: hint.priority):
+    needed = displayWidth(hint.text) + (len(HINT_SEPARATOR) if chosen else 0)
+    if usedWidth + needed > availableWidth:
+      continue
+    chosen.append(hint)
+    usedWidth += needed
+
+  # 並びは元の表示順へ戻し，キーの位置が幅によって動かないようにする
+  chosen.sort(key=candidates.index)
+  return HINT_SEPARATOR.join(hint.text for hint in chosen)
+
 
 # 保存名として受け付ける最大文字数
 MAX_INPUT_LENGTH = 40
@@ -56,10 +107,6 @@ BACKSPACE_KEYS = ("\x7f", "\x08")
 
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
-
-# 再生開始前に動画全体の黒帯を確認する代表サンプル数
-BORDER_SCAN_SAMPLES = 12
-
 
 class RenderedFrameStore:
   """事前生成したフレーム文字列を一時ファイルへ保存する."""
@@ -186,12 +233,14 @@ class Player:
     self._nextFrameIndex = 0
     self._lastRenderedMedia: float | None = None
     self._lastSize: tuple[int, int, int, int] | None = None
-    self._letterboxBounds: tuple[int, int, int, int] | None = None
     self._preRenderedFrames: RenderedFrameStore | None = None
     self._preRenderedLayout: tuple[int, int, int, int] | None = None
     self._audioPlayer: audioModule.AudioPlayer | None = None
     self._previousHandlers: dict = {}
     self._keyReader: KeyReader | None = None
+    # 一時的にステータス行へ出す知らせ
+    self._notice = ""
+    self._noticeUntil = 0.0
 
   # -------------------------------------------------------------------------
   # 再生の入口
@@ -216,7 +265,6 @@ class Player:
     capture = self._openCapture(cv2)
 
     self._capture = capture
-    self._letterboxBounds = None
     self._videoFps = self._readFps(capture, cv2)
     self._duration = self._readDuration(capture, cv2)
     if self._duration <= 0 and self.options.duration:
@@ -224,8 +272,6 @@ class Player:
       self._duration = float(self.options.duration)
 
     try:
-      # 動画全体で固定されている黒帯だけを再生前にクロップ対象にする
-      self._letterboxBounds = self._scanPersistentBorders(capture, cv2)
       if self.options.preRender:
         # 描画処理を再生前に終え，実際の再生中は文字列の出力だけにする
         self._preRenderVideo(capture)
@@ -365,67 +411,6 @@ class Player:
       return 0.0
     return float(frameCount) / self._videoFps
 
-  @staticmethod
-  def _scanPersistentBorders(capture, cv2Module):
-    """動画全体から代表フレームを読み，常に黒い境界だけを返す.
-
-    シークできないストリームやフレーム数を取得できない動画では，安全側に倒して
-    クロップしない（None）．サンプル間で境界が変わる場合も，その辺は残す.
-    """
-    rawFrameCount = capture.get(cv2Module.CAP_PROP_FRAME_COUNT)
-    if rawFrameCount is None or rawFrameCount != rawFrameCount or rawFrameCount < 3:
-      return None
-
-    frameCount = int(rawFrameCount)
-    sampleCount = min(BORDER_SCAN_SAMPLES, frameCount)
-    sampleIndices = [
-      round(index * (frameCount - 1) / max(1, sampleCount - 1))
-      for index in range(sampleCount)
-    ]
-    sampledBounds: list[tuple[int, int, int, int]] = []
-    frameHeight = frameWidth = 0
-
-    try:
-      for frameIndex in sampleIndices:
-        if not capture.set(cv2Module.CAP_PROP_POS_FRAMES, frameIndex):
-          return None
-        isRead, frame = capture.read()
-        if not isRead or frame is None:
-          return None
-        frameHeight, frameWidth = frame.shape[:2]
-        sampledBounds.append(renderer.detectBlackBorders(frame))
-    finally:
-      # 先読みスレッドが必ず先頭から始められるように戻す
-      capture.set(cv2Module.CAP_PROP_POS_FRAMES, 0)
-
-    if not sampledBounds or frameHeight <= 0 or frameWidth <= 0:
-      return None
-
-    def persistentStart(values: list[int], size: int) -> int:
-      minimumSize = max(2, round(size * renderer.LETTERBOX_MIN_FRACTION))
-      tolerance = max(2, round(size * 0.01))
-      if min(values) < minimumSize or max(values) - min(values) > tolerance:
-        return 0
-      return min(values)
-
-    def persistentEnd(values: list[int], size: int) -> int:
-      minimumSize = max(2, round(size * renderer.LETTERBOX_MIN_FRACTION))
-      tolerance = max(2, round(size * 0.01))
-      if size - max(values) < minimumSize or max(values) - min(values) > tolerance:
-        return size
-      return max(values)
-
-    topValues = [bounds[0] for bounds in sampledBounds]
-    bottomValues = [bounds[1] for bounds in sampledBounds]
-    leftValues = [bounds[2] for bounds in sampledBounds]
-    rightValues = [bounds[3] for bounds in sampledBounds]
-    return (
-      persistentStart(topValues, frameHeight),
-      persistentEnd(bottomValues, frameHeight),
-      persistentStart(leftValues, frameWidth),
-      persistentEnd(rightValues, frameWidth),
-    )
-
   def _preRenderVideo(self, capture) -> None:
     """動画を先頭から最後まで変換し，描画用の一時ファイルへ保存する."""
     terminalWidth, terminalHeight = self._terminalSize()
@@ -496,17 +481,29 @@ class Player:
       self._audioPlayer.stop()
       return
 
-    # ffplay の起動遅延の分だけ先の位置から鳴らし，映像と頭出しを揃える
-    startPosition = (
-      self._mediaTime()
-      + config.AUDIO_START_LATENCY * self._speed
-      + self.options.audioOffset
-    )
+    # 音声を現在位置から起動し，ffplay自身の音声クロックが動き始めるまで
+    # 映像側のクロックを進めない．固定遅延を足すだけだと，環境ごとの
+    # ffplay起動時間の差によって映像が先行する．
+    mediaPosition = self._mediaTime()
+    startPosition = mediaPosition + self.options.audioOffset
     self._audioPlayer.start(
       position=startPosition,
       speed=self._speed,
       volume=self._volume,
     )
+
+    waitUntilReady = getattr(self._audioPlayer, "waitUntilReady", None)
+    readyPosition = (
+      waitUntilReady(config.AUDIO_READY_TIMEOUT)
+      if callable(waitUntilReady)
+      else None
+    )
+    if readyPosition is not None:
+      # ffplayの位置は音声側の補正を含むため，映像の位置へ戻す．
+      mediaPosition = max(0.0, readyPosition - self.options.audioOffset)
+
+    self._mediaBase = mediaPosition
+    self._startClock()
 
   # -------------------------------------------------------------------------
   # メインループ
@@ -714,11 +711,20 @@ class Player:
       self._changeSpeed(-config.SPEED_STEP)
       return True
 
-    if key == "0":
+    if len(key) == 1 and key in "0123456789":
+      # 0〜9 は常に「動画の 0〜90% の位置へ移動」とする．
+      # 動画によって音量操作へ変わると，同じキーの意味が二通りになるため．
+      if self._duration > 0:
+        self._seekToFraction(int(key) / 10.0)
+      else:
+        self._showNotice("この動画は長さが分からないため，位置を移動できません．")
+      return True
+
+    if key == VOLUME_UP_KEY:
       self._changeVolume(config.VOLUME_STEP)
       return True
 
-    if key == "9":
+    if key == VOLUME_DOWN_KEY:
       self._changeVolume(-config.VOLUME_STEP)
       return True
 
@@ -755,7 +761,17 @@ class Player:
 
   def _seekBy(self, seconds: float) -> None:
     """現在位置から指定秒数だけ前後へ移動する."""
-    target = max(0.0, self._mediaTime() + seconds)
+    self._seekTo(self._mediaTime() + seconds)
+
+  def _seekToFraction(self, fraction: float) -> None:
+    """動画全体に対する割合（0.0〜1.0）で位置を指定する."""
+    if self._duration <= 0:
+      return
+    self._seekTo(self._duration * fraction)
+
+  def _seekTo(self, target: float) -> None:
+    """指定した動画内の時刻へ移動し，映像と音声の基準を更新する."""
+    target = max(0.0, target)
     if self._duration > 0:
       target = min(target, self._duration)
 
@@ -938,14 +954,7 @@ class Player:
     terminalWidth: int | None = None,
     terminalHeight: int | None = None,
   ) -> tuple[str, int, int, int, int]:
-    """フレームをクロップ・サイズ計算・文字列化する."""
-    if self._letterboxBounds is None:
-      self._letterboxBounds = (0, frame.shape[0], 0, frame.shape[1])
-    top, bottom, left, right = self._letterboxBounds
-    if top > 0 or bottom < frame.shape[0] or left > 0 or right < frame.shape[1]:
-      # 映画由来の黒帯を除いてからサイズ計算し，映像部分を端末いっぱいに表示する
-      frame = frame[top:bottom, left:right]
-
+    """フレームのサイズ計算・文字列化を行う（元の画角を維持する）."""
     frameHeight, frameWidth = frame.shape[:2]
     if terminalWidth is None or terminalHeight is None:
       terminalWidth, terminalHeight = self._terminalSize()
@@ -1039,25 +1048,40 @@ class Player:
     )
     self._write(self._statusText(rows, terminalWidth, topOffset))
 
+  def _showNotice(self, message: str) -> None:
+    """操作できなかった理由などを，ステータス行へ少しの間だけ表示する."""
+    self._notice = message
+    self._noticeUntil = time.perf_counter() + NOTICE_SECONDS
+
   def _statusText(self, rows: int, terminalWidth: int, rowOffset: int = 0) -> str:
     """画面下部に表示するステータス行を組み立てる."""
+    if self._notice and time.perf_counter() < self._noticeUntil:
+      body = truncateToWidth(self._notice, max(0, terminalWidth))
+      return f"{ESC}[{rowOffset + rows + 1};1H{DIM}{body}{RESET_ATTRIBUTES}{CLEAR_LINE}"
+
+    self._notice = ""
     state = "一時停止" if self._paused else "再生中"
     position = formatTime(self._mediaTime())
     total = formatTime(self._duration) if self._duration > 0 else "--:--"
-    if self._audioPlayer is None:
-      audioState = "-"
-    elif self._muted:
-      audioState = "消音"
-    else:
-      audioState = f"{self._volume}%"
     # 動画のタイトルは外部由来のため，制御文字を取り除いてから表示する
     title = sanitizeText(self.options.title or Path(self.videoPath).name)
+    # 題名が長くても操作説明が消えないように，題名の幅を抑える
+    title = truncateToWidth(title, max(TITLE_MIN_WIDTH, terminalWidth // TITLE_WIDTH_RATIO))
 
-    body = (
-      f"{state} {title}  {position}/{total}  x{self._speed:.2f}  "
-      f"{self.options.mode}  音声:{audioState}  {KEY_HELP}"
+    # 既定のままの項目は書かず，操作説明のための幅を空ける
+    parts = [f"{state} {title}", f"{position}/{total}"]
+    if abs(self._speed - 1.0) > SPEED_EPSILON:
+      parts.append(f"x{self._speed:.2f}")
+    parts.append(self.options.mode)
+    if self._audioPlayer is not None:
+      parts.append(f"音声:{'消音' if self._muted else f'{self._volume}%'}")
+    leading = "  ".join(parts) + "  "
+    # 残った幅に収まる操作説明だけを並べる
+    keyHelp = buildKeyHelp(
+      max(0, terminalWidth - displayWidth(leading)),
+      self._audioPlayer is not None,
     )
-    body = truncateToWidth(body, max(0, terminalWidth))
+    body = truncateToWidth(leading + keyHelp, max(0, terminalWidth))
 
     # ステータス行は中央配置した描画領域のすぐ下へ表示する
     return f"{ESC}[{rowOffset + rows + 1};1H{DIM}{body}{RESET_ATTRIBUTES}{CLEAR_LINE}"

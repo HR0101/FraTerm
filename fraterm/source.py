@@ -32,6 +32,13 @@ PARTIAL_SUFFIX = ".part"
 # これより小さいファイルは失敗した残骸とみなす
 MIN_CACHE_FILE_SIZE = 1024
 
+# 通信が切れた場合にダウンロードをやり直す回数（--continue で続きから取得する）
+DOWNLOAD_ATTEMPTS = 3
+
+# yt-dlp 自身に行わせる再試行の回数と，1接続あたりの待ち時間（秒）
+YTDLP_RETRIES = 10
+SOCKET_TIMEOUT = 30
+
 # YouTubeの署名解読に使えるJavaScriptランタイム（yt-dlp の優先順）
 # yt-dlp は既定で deno しか有効にしないため，導入済みのものを明示的に有効化する
 JS_RUNTIMES = ("deno", "node", "quickjs", "bun")
@@ -402,31 +409,58 @@ def downloadToCache(
 
   # 途中で失敗したファイルを完成品と取り違えないよう，別名で受け取る
   partialPath = targetPath.with_name(targetPath.name + PARTIAL_SUFFIX)
-  removeQuietly(partialPath)
-
   cookieArguments = cookies.toArguments() if cookies is not None else []
-  try:
-    runYtdlp(
-      [
-        "--no-playlist",
-        "--no-progress",
-        "--no-warnings",
-        *jsRuntimeArguments(),
-        "-f",
-        formatSelector(quality),
-        *cookieArguments,
-        "-o",
-        str(partialPath),
-        url,
-      ],
-      DOWNLOAD_TIMEOUT,
-    )
-  except SourceError:
-    removeQuietly(partialPath)
-    raise
 
-  if not isUsableCache(partialPath):
+  for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+    try:
+      runYtdlp(
+        [
+          "--no-playlist",
+          "--no-progress",
+          "--no-warnings",
+          # 通信が途切れても，yt-dlp 自身が細かく再試行するようにする
+          "--retries",
+          str(YTDLP_RETRIES),
+          "--fragment-retries",
+          str(YTDLP_RETRIES),
+          "--socket-timeout",
+          str(SOCKET_TIMEOUT),
+          # 中断した位置から再開し，やり直しの通信量を抑える
+          "--continue",
+          *jsRuntimeArguments(),
+          "-f",
+          formatSelector(quality),
+          *cookieArguments,
+          "-o",
+          str(partialPath),
+          url,
+        ],
+        DOWNLOAD_TIMEOUT,
+      )
+    except SourceError as error:
+      if attempt < DOWNLOAD_ATTEMPTS:
+        if notify is not None:
+          notify(f"接続が切れたため再開します（{attempt}/{DOWNLOAD_ATTEMPTS - 1}）．")
+        # 途中まで取得したファイルは残し，--continue で続きから取得する
+        continue
+      removeQuietly(partialPath)
+      raise SourceError(
+        f"動画をダウンロードできませんでした．{error.message}",
+        hint=(
+          "通信が不安定な可能性があります．"
+          "しばらく待ってからもう一度お試しください．"
+        ),
+      ) from error
+
+    if isUsableCache(partialPath):
+      break
+
     fileSize = partialPath.stat().st_size if partialPath.is_file() else 0
+    if attempt < DOWNLOAD_ATTEMPTS:
+      if notify is not None:
+        notify(f"取得できた分が不足しているため再開します（{fileSize}バイト）．")
+      continue
+
     removeQuietly(partialPath)
     raise SourceError(
       f"ダウンロードした動画が不完全です（{fileSize}バイト）．",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -15,6 +16,7 @@ from .errors import NameNotFoundError
 from .registry import (
   Registry,
   VideoEntry,
+  notFoundError,
   resolveVideoPath,
   similarNames,
   validateName,
@@ -113,8 +115,8 @@ URLから再生する（yt-dlp が必要です）:
 短縮形: -m モード / -s 文字セット / -c 着色 / -w 幅 / -a 音声 / -q 画質 / -b ブラウザ
 
 再生中の操作:
-  q: 終了 / space: 一時停止・再開 / ←→: 10秒移動 / r: 先頭から / m: ミュート
-  +,-: 再生速度 / 9,0: 音量 / s: 保存
+  q: 終了 / space: 一時停止・再開 / 0-9: 位置移動 / ←→: 10秒移動 / r: 先頭から / m: ミュート
+  +,-: 再生速度 / [,]: 音量 / s: 保存
 
 URLは引用符で囲んでください（zshでは `?` がエラーになります）．
 """
@@ -504,22 +506,27 @@ def buildParser() -> argparse.ArgumentParser:
   # play --------------------------------------------------------------------
   playParser = subparsers.add_parser(
     "play",
-    help="登録した動画を再生する",
-    description="登録した動画を再生します．オプションは今回の再生にのみ適用されます．",
+    help="動画を再生する（登録名・ファイル・URLのいずれでも指定できます）",
+    description=(
+      "登録名・動画ファイル・URL のいずれでも再生できます．"
+      "オプションは今回の再生にのみ適用されます．"
+    ),
   )
-  playParser.add_argument("name", help="登録名")
+  playParser.add_argument("target", metavar="登録名/ファイル/URL", help="再生するもの")
   addPlaybackArguments(playParser, includeStatus=True)
-  playParser.set_defaults(handler=handlePlay)
+  playParser.set_defaults(handler=handlePlayback)
 
   # run ---------------------------------------------------------------------
   runParser = subparsers.add_parser(
     "run",
-    help="動画ファイルやURLを登録せずに再生する",
-    description="動画ファイルまたはURLを登録せずに再生します．",
+    help="動画を再生する（play と同じ．登録せずに使うことが多い指定向け）",
+    description=(
+      "動画ファイル・URL・登録名のいずれでも再生できます．play と同じ動作です．"
+    ),
   )
-  runParser.add_argument("path", help="動画ファイルのパス，またはURL")
+  runParser.add_argument("target", metavar="ファイル/URL/登録名", help="再生するもの")
   addPlaybackArguments(runParser, includeStatus=True)
-  runParser.set_defaults(handler=handleRun)
+  runParser.set_defaults(handler=handlePlayback)
 
   # cache -------------------------------------------------------------------
   cacheParser = subparsers.add_parser(
@@ -786,11 +793,63 @@ def getEntryWithSuggestions(name: str):
     raise
 
 
-def handlePlay(args: argparse.Namespace) -> int:
+def handlePlayback(args: argparse.Namespace) -> int:
+  """登録名・ファイル・URL のいずれでも再生する.
+
+  play と run で指定できるものを分けると，どちらを使うか覚える必要が生じる．
+  同じ入り口として扱い，指定された文字列から自動で判別する.
+  """
+  target = args.target
+  if config.isUrl(target):
+    return playDirectly(args)
+  if target in loadRegisteredNames():
+    return playRegistered(args)
+  if Path(target).expanduser().is_file():
+    return playDirectly(args)
+
+  # 登録名でもファイルでもないため，どちらの入力ミスかを見分けて案内する
+  raise unresolvedTargetError(target)
+
+
+def looksLikePath(target: str) -> bool:
+  """ファイルの場所を指した入力かどうかを推測する."""
+  if os.sep in target or target.startswith(("~", ".")):
+    return True
+  # 拡張子が付いていればファイル指定とみなす
+  return Path(target).suffix != ""
+
+
+def unresolvedTargetError(target: str) -> FraTermError:
+  """登録名にもファイルにも一致しない入力へのエラーを組み立てる."""
+  if looksLikePath(target):
+    return VideoFileError(
+      f"動画ファイルが見つかりません: {Path(target).expanduser()}",
+      hint="パスが正しいか確認してください．",
+    )
+
+  error = notFoundError(target, sorted(loadRegisteredNames()))
+  commandSuggestions = similarNames(target, sorted(config.COMMAND_NAMES))
+  if commandSuggestions:
+    error.hint = (
+      f"コマンド名の打ち間違いかもしれません: "
+      f"`{config.commandName()} {commandSuggestions[0]}`\n{error.hint or ''}"
+    )
+  return error
+
+
+def loadRegisteredNames() -> set[str]:
+  """登録名の一覧を読み込む．読み込めない場合は空として扱う."""
+  try:
+    return set(Registry().load())
+  except FraTermError:
+    return set()
+
+
+def playRegistered(args: argparse.Namespace) -> int:
   """登録した動画を再生する."""
   playerModule = importPlayerModule()
 
-  entry = getEntryWithSuggestions(args.name)
+  entry = getEntryWithSuggestions(args.target)
   if not entry.videoExists():
     raise VideoFileError(
       f"「{entry.name}」の動画ファイルが見つかりません: {entry.path}",
@@ -809,20 +868,20 @@ def handlePlay(args: argparse.Namespace) -> int:
   return startPlayback(playerModule, playable.path, options)
 
 
-def handleRun(args: argparse.Namespace) -> int:
+def playDirectly(args: argparse.Namespace) -> int:
   """登録せずに動画ファイルやURLを再生する."""
   applyDefaults(args)
   playerModule = importPlayerModule()
 
   quality, useCache, cookies = sourceSettings(args)
-  playable = source.openSource(args.path, quality, useCache, notifyProgress, cookies)
+  playable = source.openSource(args.target, quality, useCache, notifyProgress, cookies)
 
   options = playerModule.PlaybackOptions(
     title=playable.title, duration=playable.duration
   )
   applyOverrides(options, args)
   # 元の指定（URLまたはファイルパス）を保存対象にする
-  options.onSave = buildSaveHandler(args.path, options, args)
+  options.onSave = buildSaveHandler(args.target, options, args)
   return startPlayback(playerModule, playable.path, options)
 
 

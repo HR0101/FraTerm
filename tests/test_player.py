@@ -181,6 +181,94 @@ def test_seekKeysUseTenSecondStep(dummyVideo):
   ]
 
 
+def test_renderedSizeFollowsTerminal(sampleVideo):
+  """同じ動画が，端末の大きさに応じた文字数で描かれることを確認する."""
+  from fraterm import renderer
+
+  frameWidth, frameHeight = 320, 240
+  small = renderer.computeSize(frameWidth, frameHeight, 80, 24)
+  large = renderer.computeSize(frameWidth, frameHeight, 160, 50)
+
+  assert large[0] > small[0] and large[1] > small[1]
+  # どちらも元の縦横比を保っている（文字セルの縦横比を考慮する）
+  for columns, rows in (small, large):
+    shownAspect = columns / (rows * config.CELL_ASPECT_RATIO)
+    assert abs(shownAspect - frameWidth / frameHeight) < 0.15
+
+
+def test_savedWidthCapsLargerTerminal(sampleVideo):
+  """幅を指定して登録すると，大きい端末でもその幅で止まることを確認する."""
+  from fraterm import renderer
+
+  columns, _ = renderer.computeSize(320, 240, 160, 50, maxWidth=50)
+  assert columns == 50
+
+
+def test_preRenderedLayoutDetectsTerminalResize(dummyVideo, monkeypatch):
+  """事前生成後に端末サイズが変わったことを検出できることを確認する."""
+  player = Player(dummyVideo, PlaybackOptions(preRender=True), stream=io.StringIO())
+  player._preRenderedLayout = (60, 20, 80, 24)
+
+  monkeypatch.setattr(player, "_terminalSize", lambda: (80, 24))
+  assert player._terminalSizeChanged() is False
+
+  monkeypatch.setattr(player, "_terminalSize", lambda: (160, 50))
+  assert player._terminalSizeChanged() is True
+
+
+def test_noResizeDetectionWithoutPreRender(dummyVideo):
+  """事前生成していない場合は，切り替えの判定を行わないことを確認する."""
+  player = Player(dummyVideo, stream=io.StringIO())
+  assert player._terminalSizeChanged() is False
+
+
+def test_resizeSwitchesToLiveRendering(sampleVideo, monkeypatch):
+  """端末サイズが変わったら，その位置から通常描画へ切り替わることを確認する."""
+  player = Player(sampleVideo, PlaybackOptions(preRender=True), stream=io.StringIO())
+
+  store = __import__("fraterm.player", fromlist=["x"]).RenderedFrameStore()
+  store.append("古い生成結果")
+  player._preRenderedFrames = store
+  player._preRenderedLayout = (60, 20, 80, 24)
+  player._nextFrameIndex = 3
+
+  assert player._switchToLiveRendering() is True
+
+  # 事前生成の結果は破棄され，現在位置から読み直す状態になる
+  assert player._preRenderedFrames is None
+  assert player._preRenderedLayout is None
+  assert player._frameReader is not None
+  assert player._lastSize is None
+
+  if player._frameReader is not None:
+    player._frameReader.close()
+  if player._capture is not None:
+    player._capture.release()
+
+
+def test_resizeKeepsPlayingWhenSourceCannotBeReopened(dummyVideo, monkeypatch):
+  """開き直せない場合でも，再生を止めずに続けることを確認する."""
+  import fraterm.player as playerModule
+
+  player = Player(
+    "https://example.invalid/video.mp4",
+    PlaybackOptions(preRender=True),
+    stream=io.StringIO(),
+  )
+  store = playerModule.RenderedFrameStore()
+  store.append("生成済みのフレーム")
+  player._preRenderedFrames = store
+  player._preRenderedLayout = (60, 20, 80, 24)
+  monkeypatch.setattr(player, "_terminalSize", lambda: (100, 30))
+
+  # 開き直せない場合は偽を返し，事前生成の結果を保ったまま続行する
+  assert player._switchToLiveRendering() is False
+  assert player._preRenderedFrames is store
+  assert player._preRenderedLayout == (60, 20, 100, 30)
+
+  store.close()
+
+
 class FakeCapture:
   """OpenCV の VideoCapture を模したテスト用のクラス."""
 
@@ -375,12 +463,18 @@ class FakeAudioPlayer:
   def __init__(self) -> None:
     self.starts: list[dict] = []
     self.stopCount = 0
+    self.readyPosition: float | None = None
+    self.waitTimeouts: list[float] = []
 
   def start(self, position=0.0, speed=1.0, volume=config.DEFAULT_VOLUME) -> None:
     self.starts.append({"position": position, "speed": speed, "volume": volume})
 
   def stop(self) -> None:
     self.stopCount += 1
+
+  def waitUntilReady(self, timeout=config.AUDIO_READY_TIMEOUT):
+    self.waitTimeouts.append(timeout)
+    return self.readyPosition
 
 
 def makeAudioPlayer(dummyVideo, **optionValues):
@@ -393,22 +487,28 @@ def makeAudioPlayer(dummyVideo, **optionValues):
   return player, fakeAudio
 
 
-def test_audioLatencyUsesConservativeUpperBound():
-  """映像が先行しないよう，実測遅延の上限を既定値にしていることを確認する."""
-  assert config.AUDIO_START_LATENCY >= 0.55
+@pytest.mark.parametrize(
+  "status, expected",
+  [
+    ("   0.55 M-A:  0.000", 0.55),
+    ("\x1b[2K\r   12.345 M-A: -0.001", 12.345),
+    ("    nan M-A:    nan", None),
+    ("audio decoder is ready", None),
+  ],
+)
+def test_audioPositionFromStatus(status, expected):
+  """ffplayの進捗行から音声位置だけを安全に取り出す."""
+  assert audio.audioPositionFromStatus(status) == expected
 
 
-def test_audioStartsAtLatencyCompensatedPosition(dummyVideo):
-  """ffplayの起動遅延を見込んだ位置から音声を開始することを確認する."""
+def test_audioStartsAtCurrentMediaPosition(dummyVideo):
+  """音声を固定補正せず，現在の映像位置から開始することを確認する."""
   player, fakeAudio = makeAudioPlayer(dummyVideo)
   player._mediaTime = lambda: 0.0
   player._syncAudio()
 
   assert len(fakeAudio.starts) == 1
-  # 現在位置よりも起動遅延の分だけ先を指定している
-  assert fakeAudio.starts[0]["position"] == pytest.approx(
-    config.AUDIO_START_LATENCY
-  )
+  assert fakeAudio.starts[0]["position"] == pytest.approx(0.0)
 
 
 def test_audioOffsetShiftsStartPosition(dummyVideo):
@@ -417,31 +517,41 @@ def test_audioOffsetShiftsStartPosition(dummyVideo):
   player._mediaTime = lambda: 0.0
   player._syncAudio()
 
-  assert fakeAudio.starts[0]["position"] == pytest.approx(
-    config.AUDIO_START_LATENCY + 1.5
-  )
+  assert fakeAudio.starts[0]["position"] == pytest.approx(1.5)
+
+
+def test_audioReadyPositionRebasesVideoClock(dummyVideo):
+  """ffplayから受け取った音声位置を基準に映像クロックを合わせる."""
+  player, fakeAudio = makeAudioPlayer(dummyVideo, audioOffset=1.5)
+  player._mediaTime = lambda: 10.0
+  fakeAudio.readyPosition = 12.5
+
+  player._syncAudio()
+
+  assert player._mediaBase == pytest.approx(11.0)
+  assert fakeAudio.waitTimeouts == [config.AUDIO_READY_TIMEOUT]
 
 
 def test_volumeKeysChangeVolume(dummyVideo):
-  """9と0のキーで音量が変わり，音声を鳴らし直すことを確認する."""
+  """[ と ] のキーで音量が変わり，音声を鳴らし直すことを確認する."""
   player, fakeAudio = makeAudioPlayer(dummyVideo, volume=50)
 
-  player._handleKey("0")
+  player._handleKey("]")
   assert player._volume == 50 + config.VOLUME_STEP
   assert fakeAudio.starts[-1]["volume"] == player._volume
 
-  player._handleKey("9")
+  player._handleKey("[")
   assert player._volume == 50
 
 
 def test_volumeIsClamped(dummyVideo):
   """音量が上下限を超えないことを確認する."""
   player, _ = makeAudioPlayer(dummyVideo, volume=config.MAX_VOLUME)
-  player._handleKey("0")
+  player._handleKey("]")
   assert player._volume == config.MAX_VOLUME
 
   player, _ = makeAudioPlayer(dummyVideo, volume=config.MIN_VOLUME)
-  player._handleKey("9")
+  player._handleKey("[")
   assert player._volume == config.MIN_VOLUME
 
 

@@ -132,12 +132,67 @@ def test_arrowKeysAreNotInsertedIntoInput(isolatedHome):
   screen.state.itemIndex = [item.key for item in menu.SETTING_ITEMS].index("width")
 
   screen.handleKey("\r")
-  screen.handleKey("8")
+  for character in "80":
+    screen.handleKey(character)
   screen.handleKey(KEY_DOWN)
-  screen.handleKey("0")
+
+  # 矢印キーの文字列が値へ混ざらず，入力した数値だけが保存される
+  assert settings.load()["width"] == 80
+
+
+def test_arrowKeyCommitsInputAndMoves(isolatedHome):
+  """入力中に上下キーを押すと，確定してそのまま項目を移動することを確認する."""
+  from fraterm.keyboard import KEY_DOWN
+
+  screen = settingsScreen("width")
+  startIndex = screen.state.itemIndex
+
+  screen.handleKey("\r")
+  for character in "120":
+    screen.handleKey(character)
+  screen.handleKey(KEY_DOWN)
+
+  assert settings.load()["width"] == 120  # Enter を押さずに保存されている
+  assert screen.state.editing is False
+  assert screen.state.itemIndex == startIndex + 1  # そのまま次の項目へ移動している
+
+
+def test_sideArrowCommitsInputAndAdjusts(isolatedHome):
+  """入力中に左右キーを押すと，確定してから1段階変更することを確認する."""
+  from fraterm.keyboard import KEY_RIGHT
+
+  screen = settingsScreen("width")
+  widthItem = next(item for item in menu.SETTING_ITEMS if item.key == "width")
+
+  screen.handleKey("\r")
+  for character in "100":
+    screen.handleKey(character)
+  screen.handleKey(KEY_RIGHT)
+
+  assert settings.load()["width"] == 100 + widthItem.step
+  assert screen.state.editing is False
+
+
+@pytest.mark.parametrize(
+  "key, typed, expected",
+  [
+    ("width", "8", 10),  # 下限へ収める
+    ("width", "9999", 500),  # 上限へ収める
+    ("volume", "500", 100),
+    ("brightness", "99", 1.0),
+    ("brightness", "0.5", 0.5),  # 範囲内はそのまま
+  ],
+)
+def test_typedNumberIsKeptInRange(isolatedHome, key, typed, expected):
+  """打ち込んだ数値が，設定できる範囲へ収まることを確認する."""
+  screen = settingsScreen(key)
+
+  screen.handleKey("\r")
+  for character in typed:
+    screen.handleKey(character)
   screen.handleKey("\r")
 
-  assert settings.load()["width"] == 80
+  assert settings.load()[key] == expected
 
 
 @pytest.mark.parametrize("key", ["q", "Q", "\x1b"])
